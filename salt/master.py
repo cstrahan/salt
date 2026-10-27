@@ -61,6 +61,7 @@ import salt.utils.master
 import salt.utils.metrics
 import salt.utils.minions
 import salt.utils.platform
+import salt.utils.presence
 import salt.utils.process
 import salt.utils.resource_registry
 import salt.utils.schedule
@@ -76,7 +77,7 @@ from salt.defaults import DEFAULT_TARGET_DELIM
 from salt.exceptions import UnsupportedAlgorithm
 from salt.transport import TRANSPORTS
 from salt.utils.cache import CacheCli
-from salt.utils.channel import iter_transport_opts
+from salt.utils.channel import iter_transport_opts, transport_provides_presence
 from salt.utils.debug import enable_sigusr1_handler, enable_sigusr2_handler
 from salt.utils.event import tagify
 from salt.utils.zeromq import ZMQ_VERSION_INFO, zmq
@@ -439,14 +440,11 @@ class Maintenance(salt.utils.process.SignalHandlingProcess):
 
         self.presence_events = False
         if self.opts.get("presence_events", False):
-            tcp_only = True
-            for transport, _ in iter_transport_opts(self.opts):
-                if transport != "tcp":
-                    tcp_only = False
-            if not tcp_only:
-                # For a TCP only transport, the presence events will be
-                # handled in the transport code.
-                self.presence_events = True
+            # Poll connected_ids() only when the transport cannot report
+            # presence itself; when it can, the publish server emits the
+            # events and polling here would contradict it with a less
+            # accurate answer.
+            self.presence_events = not transport_provides_presence(self.opts)
 
     def run(self):
         """
@@ -4062,9 +4060,13 @@ class AuthFuncs(TransportMethods):
             if self.cache_cli:
                 minions = self.cache_cli.get_cached()
             else:
-                # ``connected_ids`` walks the minion data cache on disk;
-                # offload to the executor so a slow cache doesn't stall the
-                # auth loop.
+                # ``connected_ids`` walks the minion data cache on disk on
+                # every call -- the publish server's presence record is
+                # unioned with that walk rather than replacing it -- so
+                # this is always the expensive path, and it is the one a
+                # master under memory or disk pressure is most likely to
+                # be struggling with. Offloaded to the executor so a slow cache doesn't
+                # stall the auth loop.
                 minions = await loop.run_in_executor(None, self.ckminions.connected_ids)
                 if len(minions) > 1000:
                     log.info(

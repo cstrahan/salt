@@ -357,6 +357,7 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         remove_presence_callback=None,
         secrets=None,
         started=None,
+        on_start=None,
     ):
         """
         Bind to the interface specified in the configuration file
@@ -371,6 +372,9 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
 
         io_loop.add_signal_handler(signal.SIGTERM, io_loop.stop)
 
+        if on_start is not None:
+            # See the zeromq transport: the caller has no loop of its own.
+            io_loop.call_soon(on_start)
         publisher_task = io_loop.create_task(
             self.publisher(publish_payload, io_loop=io_loop)
         )

@@ -767,6 +767,7 @@ def test_presence_events_callback_passed(temp_salt_master, salt_message_client):
             channel.remove_presence_callback,
             secrets=None,
             started=None,
+            on_start=channel._start_presence_heartbeat,
         )
 
 

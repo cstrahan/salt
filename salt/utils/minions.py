@@ -14,6 +14,7 @@ import salt.transport
 import salt.utils.data
 import salt.utils.files
 import salt.utils.network
+import salt.utils.presence
 import salt.utils.resource_registry
 import salt.utils.resources
 import salt.utils.stringutils
@@ -1002,6 +1003,77 @@ class CkMinions:
     def connected_ids(self, subset=None, show_ip=False):
         """
         Return a set of all connected minion ids, optionally within a subset
+
+        Two sources, unioned, because each one's blind spot is the other's
+        strength:
+
+        - The publish server's record names the minion behind each
+          connection outright. Address matching cannot: it infers identity
+          by matching a minion's *cached grain* addresses against the
+          master's socket table, so it never matches a minion whose
+          connection address differs from its grains -- NAT, floating IPs,
+          a master managing minions in another network -- and reports it
+          absent while it is perfectly reachable. That is issue #66295.
+
+        - Address matching sees every connection. The record only names
+          subscribers that announce themselves, which means minions new
+          enough to do so. A master that has just enabled this, with a
+          fleet it has not finished upgrading, has a record naming three
+          minions out of five hundred.
+
+        Answering from the record *alone* would therefore trade one
+        false-absent bug for a worse one, and reachable during the normal
+        rollout order rather than only under NAT: ``manage.not_present``
+        would list the entire un-upgraded fleet, and ``max_minions`` would
+        count three where five hundred are connected and silently stop
+        enforcing. Unioning cannot under-report relative to the address
+        matching Salt has always done, so the limit can only ever fail
+        closed, never open.
+
+        What the union does not do is make address matching's *false
+        positives* go away -- a departed minion whose stale grain address
+        happens to match some other connection is still reported. That is
+        unchanged from before this feature, and outside what #66295 is
+        about. The record's answer wins for any id it names, so a minion
+        it can name is reported at its real connection address.
+
+        A record that is missing, stale, from a publish server too
+        recently started to have the fleet back, or that names nobody at
+        all means "no answer", not "nobody is connected", and the result
+        is then address matching on its own; see
+        :mod:`salt.utils.presence`.
+        """
+        present = salt.utils.presence.read(self.opts)
+        if present is None:
+            return self._connected_ids_by_address(subset, show_ip)
+        if subset:
+            present = {id_: present[id_] for id_ in subset if id_ in present}
+        # ``show_ip=True`` regardless of what was asked for, because the
+        # union is keyed by id and needs an address to carry for the ids
+        # only this side knows about.
+        # Sorted, because a dual-stack minion legitimately matches twice --
+        # once from its ``ipv4`` grain and once from ``ipv6`` -- and a set
+        # yields those in an order that varies with the hash seed. Without
+        # this, ``manage.present show_ip=True`` reports a different address
+        # for the same minion from one run to the next.
+        for id_, address in sorted(
+            self._connected_ids_by_address(subset, show_ip=True)
+        ):
+            if not present.get(id_):
+                present[id_] = address
+        if show_ip:
+            return set(present.items())
+        return set(present)
+
+    def _connected_ids_by_address(self, subset=None, show_ip=False):
+        """
+        Connected minions inferred by matching cached grain addresses against
+        the master's socket table.
+
+        What ``connected_ids()`` did before the publish server began
+        recording who is behind each connection. Kept as the fallback for
+        when it has not, and for ``detect_remote_minions``, which is about
+        connections no publish server sees.
         """
         minions = set()
         if self.opts.get("minion_data_cache", False):

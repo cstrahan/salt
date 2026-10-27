@@ -1840,6 +1840,7 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         remove_presence_callback=None,
         secrets=None,
         started=None,
+        on_start=None,
     ):
         """
         This method represents the Publish Daemon process. It is intended to be
@@ -1853,6 +1854,12 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         elif not hasattr(self, "secrets"):
             self.secrets = self.opts.get("secrets")
         io_loop = salt.utils.asynchronous.aioloop(tornado.ioloop.IOLoop())
+
+        if on_start is not None:
+            # Run on the daemon's own loop, once it exists: the caller has
+            # none of its own, and anything it needs to schedule has to be
+            # scheduled here or not at all.
+            io_loop.call_soon(on_start)
 
         publisher_task = io_loop.create_task(
             self.publisher(publish_payload, io_loop=io_loop),

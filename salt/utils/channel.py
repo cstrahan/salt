@@ -104,3 +104,77 @@ def create_request_client(opts, io_loop=None):
 
         return salt.transport.ws.RequestClient(opts, io_loop=io_loop)
     raise ValueError(f"Unsupported transport type: {ttype}")
+
+
+def transport_provides_presence(opts):
+    """Can the configured transport report minion presence itself?
+
+    True when the master has exactly one transport and it can tell the master
+    *which* minion a connection belongs to, so presence needs no inference
+    from IP addresses:
+
+    - ``tcp``: subscribers authenticate over the connection, so the publish
+      server knows the id directly.
+    - ``zeromq`` **with ``zmq_presence_subscriptions``**: subscribers
+      announce themselves on a dedicated topic nothing is published to,
+      assigned by the master at authentication and derived from a secret
+      only the master holds. It works without filtering and is the only
+      identity
+      a syndic's publish connection carries. Requires minions new enough to
+      send it; an older one is invisible, and ``zmq_filtering`` does not
+      help, because the topic it makes a minion subscribe to is derived
+      from the id alone and so proves nothing.
+
+    Otherwise presence falls back to ``CkMinions.connected_ids()``, which
+    matches cached grain IPs against the socket table and therefore
+    misreports any minion whose connection address differs from its grains
+    (NAT, floating IPs, cross-network masters).
+
+    A master configured with more than one transport is False whatever those
+    transports are. Each gets its own publish server, each of which knows
+    only its own subscribers, so each would fire a ``salt/presence/present``
+    listing half the fleet. ``CkMinions.connected_ids()`` is the only thing
+    that sees the whole master.
+
+    Presence is opt-in and only ``zmq_presence_subscriptions`` turns it on.
+    ``zmq_filtering`` deliberately has no bearing on it: a deployment that
+    already has that option set is not quietly switched onto a different
+    presence mechanism on upgrade, and the guessable delivery topic it
+    makes minions subscribe to is never accepted as identity.
+
+    Note what moves when this flips to True for an existing deployment. The
+    publish server is edge-triggered: it fires ``salt/presence/change`` and
+    ``salt/presence/present`` when a subscriber arrives or leaves, where
+    ``Maintenance.handle_presence`` fired ``present`` once per
+    ``loop_interval`` whether or not anything changed, and persisted the set
+    to ``<cachedir>/presence-data``. Consumers polling for that heartbeat see
+    the cadence change, and the on-disk cache stops being updated -- so if
+    this later flips back to False, Maintenance seeds ``old_present`` from
+    whatever was last written (within its one hour TTL) and reports the
+    difference as newly lost.
+
+    This predicate decides two things: whether the publish server fires
+    the ``salt/presence/*`` events, and whether it maintains the on-disk
+    record at all -- ``PubServerChannel._publish_daemon`` removes the
+    record when this is False. What it does *not* govern is
+    ``presence_events``, which switches the event stream on and off
+    independently; and ``CkMinions.connected_ids()`` keys off whether a
+    usable record exists rather than off either option. See
+    :mod:`salt.utils.presence`.
+    """
+    transports = dict(iter_transport_opts(opts))
+    if len(transports) != 1:
+        return False
+    ((transport, t_opts),) = transports.items()
+    if transport == "tcp":
+        return True
+    # ``t_opts`` rather than ``opts``: a ``transport_opts`` entry can set
+    # either of these for the zeromq transport alone, and this predicate is
+    # asked both of the raw master opts (``Maintenance``) and of the
+    # per-transport opts (``PubServerChannel.factory``,
+    # ``PublishServer.publisher``). Reading the override is what stops those
+    # callers disagreeing about who owns presence, which would leave the
+    # publish server and ``Maintenance`` both reporting it.
+    if transport == "zeromq" and t_opts.get("zmq_presence_subscriptions", False):
+        return True
+    return False

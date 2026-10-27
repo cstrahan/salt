@@ -1,6 +1,7 @@
 # pylint: skip-file
 import asyncio
 import collections
+import contextlib
 import os
 import pathlib
 import stat
@@ -4329,3 +4330,70 @@ async def test_handle_payload_no_cap_allows_full_concurrency(master_opts):
     )
     assert results == ["ok"] * 8
     assert max_active == 8
+
+
+@contextlib.contextmanager
+def _stub_maintenance_init():
+    """
+    Stand in for everything ``_post_fork_init`` builds before it decides who
+    owns presence -- loaders, a scheduler and an event bus, none of which the
+    decision depends on.
+    """
+    with patch("salt.runner.RunnerClient", MagicMock()), patch(
+        "salt.loader.returners", MagicMock(return_value={})
+    ), patch("salt.auth.LoadAuth", MagicMock()), patch(
+        "salt.minion.MasterMinion", MagicMock()
+    ), patch(
+        "salt.utils.schedule.Schedule", MagicMock()
+    ), patch(
+        "salt.utils.minions.CkMinions", MagicMock()
+    ), patch(
+        "salt.utils.event.get_master_event", MagicMock()
+    ), patch(
+        "salt.daemons.masterapi.init_git_pillar", MagicMock()
+    ):
+        yield
+
+
+@pytest.mark.parametrize(
+    "transport_opts,publish_server_owns_it",
+    [
+        ({"transport": "tcp"}, True),
+        ({"transport": "zeromq"}, False),
+        # zmq_filtering is no longer a presence source.
+        ({"transport": "zeromq", "zmq_filtering": True}, False),
+        ({"transport": "zeromq", "zmq_presence_subscriptions": True}, True),
+    ],
+)
+def test_maintenance_polls_presence_only_when_the_publish_server_cannot(
+    maintenance_opts, transport_opts, publish_server_owns_it
+):
+    """
+    Exactly one of ``Maintenance`` and the publish server reports presence.
+    The predicate is tested on its own elsewhere; this pins this caller to
+    it.  Were both to report, the polled answer -- the address matching this
+    whole mechanism exists to replace -- would contradict the accurate one.
+    """
+    opts = maintenance_opts.copy()
+    opts.update(transport_opts, presence_events=True)
+    maint = salt.master.Maintenance(opts)
+
+    with _stub_maintenance_init():
+        maint._post_fork_init()
+
+    assert maint.presence_events is not publish_server_owns_it
+
+
+def test_maintenance_polls_no_presence_without_presence_events(maintenance_opts):
+    """
+    ``presence_events`` off means nobody reports them, whatever the
+    transport is able to do.
+    """
+    opts = maintenance_opts.copy()
+    opts.update(transport="zeromq", presence_events=False)
+    maint = salt.master.Maintenance(opts)
+
+    with _stub_maintenance_init():
+        maint._post_fork_init()
+
+    assert maint.presence_events is False

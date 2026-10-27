@@ -2190,6 +2190,7 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         remove_presence_callback=None,
         secrets=None,
         started=None,
+        on_start=None,
     ):
         """
         Bind to the interface specified in the configuration file
@@ -2197,6 +2198,9 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         if started is not None:
             self.started = started
         io_loop = tornado.ioloop.IOLoop()
+        if on_start is not None:
+            # See the zeromq transport: the caller has no loop of its own.
+            io_loop.add_callback(on_start)
         io_loop.add_callback(
             self.publisher,
             publish_payload,

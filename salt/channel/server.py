@@ -41,6 +41,7 @@ import salt.utils.event
 import salt.utils.metrics
 import salt.utils.minions
 import salt.utils.platform
+import salt.utils.presence
 import salt.utils.stringutils
 import salt.utils.tracing
 from salt.exceptions import SaltDeserializationError
@@ -1442,15 +1443,10 @@ class PubServerChannel:
             opts["master_uri"] = kwargs["master_uri"]
         presence_events = False
         if opts.get("presence_events", False):
-            tcp_only = True
-            for transport, _ in salt.utils.channel.iter_transport_opts(opts):
-                if transport != "tcp":
-                    tcp_only = False
-            if tcp_only:
-                # Only when the transport is TCP only, the presence events will
-                # be handled here. Otherwise, it will be handled in the
-                # 'Maintenance' process.
-                presence_events = True
+            # Handle presence here when the transport can name the minion
+            # behind a connection; otherwise the 'Maintenance' process polls
+            # CkMinions.connected_ids() instead.
+            presence_events = salt.utils.channel.transport_provides_presence(opts)
         transport = salt.transport.publish_server(opts, **kwargs)
         return cls(opts, transport, presence_events=presence_events)
 
@@ -1459,9 +1455,45 @@ class PubServerChannel:
         self.ckminions = salt.utils.minions.CkMinions(self.opts)
         self.transport = transport
         self.aes_funcs = salt.master.AESFuncs(self.opts)
-        self.present = {}
         self.presence_events = presence_events
         self.event = salt.utils.event.get_event("master", opts=self.opts, listen=False)
+        self._init_presence()
+
+    def _init_presence(self):
+        """Set up presence tracking.
+
+        Called from ``__init__``, ``__setstate__`` and ``_publish_daemon``.
+        Under a spawn start method the publish daemon rebuilds this object
+        from ``__getstate__``, and that is the process where presence is
+        actually recorded, so it is the one that must not be missing any of
+        this. ``_publish_daemon`` calls it again under either start method,
+        because ``_presence_started`` has to say when *this* publish
+        daemon started rather than when the master happened to build the
+        channel -- a restarted daemon that inherited the original stamp
+        would look settled while it was still waiting for the fleet.
+        """
+        self.present = {}
+        self._presence_dirty = False
+        #: Monotonic; see ``_write_presence``.
+        self._presence_written = 0.0
+        self._presence_timer = None
+        #: When this publish server started, on a clock nothing can step.
+        #: The record carries the elapsed value rather than two wall-clock
+        #: stamps, so a step between writing them cannot make a young
+        #: record look settled or an old one look impossible.
+        self._presence_started = time.monotonic()
+        # Off until ``_publish_daemon`` establishes that this publish server
+        # is the one answering for the fleet. The transports hand their
+        # presence callbacks whatever channel they were given and call them
+        # unconditionally -- tcp always does -- so without this a master
+        # running several transports would have each publish server write a
+        # record naming only its own subscribers. One file, one master id:
+        # whichever wrote last would report every minion on the other
+        # transports as absent, which is the bug this record exists to fix.
+        self._presence_recording = False
+        #: A ``salt/presence/present`` event is owed; see
+        #: ``_fire_present_event``.
+        self._presence_event_pending = False
 
     @property
     def aes_key(self):
@@ -1478,20 +1510,50 @@ class PubServerChannel:
 
     def __setstate__(self, state):
         self.opts = state["opts"]
-        self.state = state["presence_events"]
+        # Not ``self.state``: _add_client_present / _remove_client_present read
+        # ``presence_events``, and under a spawn start method this object is
+        # rebuilt from __getstate__ in the publish daemon, where those run.
+        self.presence_events = state["presence_events"]
         self.transport = state["transport"]
         self.event = salt.utils.event.get_event("master", opts=self.opts, listen=False)
         self.ckminions = salt.utils.minions.CkMinions(self.opts)
-        self.present = {}
+        self._init_presence()
         self.master_key = salt.crypt.MasterKeys(self.opts)
 
     def close(self):
+        # Before the ioloop goes: the flush timer re-arms itself forever, so
+        # leaving it pending keeps this channel, its ``present`` map and the
+        # event handle reachable from the loop for as long as it lives.
+        if getattr(self, "_presence_timer", None) is not None:
+            self._presence_timer.cancel()
+            self._presence_timer = None
+        # And take the record with it. ``manage.present`` reads the
+        # cachedir directly and needs no running master, so a record left
+        # behind by a clean ``systemctl stop salt-master`` goes on naming
+        # the whole last-known fleet until it goes stale. Before this
+        # feature a stopped master reported nobody, because its socket
+        # table was empty.
+        if getattr(self, "_presence_recording", False):
+            self._presence_recording = False
+            try:
+                salt.utils.presence.remove(self.opts)
+            except Exception:  # pylint: disable=broad-except
+                log.error("Unable to remove the presence record", exc_info=True)
         self.transport.close()
         if self.event is not None:
             self.event.destroy()
             self.event = None
-        if self.aes_funcs is not None:
-            self.aes_funcs.destroy()
+        # getattr, not attribute access: ``__setstate__`` does not restore
+        # ``aes_funcs`` -- building one pulls in an event bus, a LocalClient,
+        # a MasterMinion and the fileserver, which the publish daemon has no
+        # use for -- so under a spawn start method this object reaches
+        # ``close`` without the attribute. The missing-attribute bug on the
+        # tcp token-verify path in ``presence_callback`` is pre-existing
+        # and left alone;
+        # there is no reason for shutdown to raise on top of it.
+        aes_funcs = getattr(self, "aes_funcs", None)
+        if aes_funcs is not None:
+            aes_funcs.destroy()
             self.aes_funcs = None
         if hasattr(self, "ckminions") and self.ckminions is not None:
             if hasattr(self.ckminions, "cache") and self.ckminions.cache is not None:
@@ -1535,15 +1597,97 @@ class PubServerChannel:
         if secrets is not None:
             salt.master.SMaster.secrets = secrets
         self.master_key = salt.crypt.MasterKeys(self.opts)
+        # A publish daemon starts with nobody connected, so the record its
+        # predecessor left behind is not one this process can vouch for --
+        # and it stays fresh, and therefore authoritative, for another
+        # ``STALE_AFTER``. Supersede it straight away with one stamped as
+        # this incarnation's: ``salt.utils.presence`` holds anything that
+        # recent as unsettled, so readers fall back for the reconnect window
+        # instead of being handed either the dead daemon's fleet or an empty
+        # one.
+        #
+        # And where the transport does *not* report presence, the record
+        # has to go. An operator who turns this off and restarts would
+        # otherwise leave the previous incarnation's roster on disk, still
+        # inside its ``STALE_AFTER`` and so still authoritative, naming a
+        # fleet that is not connected to this daemon at all: ``max_minions``
+        # over-counts and starts rejecting authentications, ``manage.present``
+        # lies, and ``ping_all_connected_minions`` targets minions that are
+        # not there. Removing it fails to address matching immediately,
+        # which is exactly what turning the option off asked for.
+        self._init_presence()
+        if salt.utils.channel.transport_provides_presence(self.opts):
+            self._presence_recording = True
+            try:
+                self._write_presence()
+            except Exception:  # pylint: disable=broad-except
+                log.error("Unable to record minion presence", exc_info=True)
+        else:
+            try:
+                salt.utils.presence.remove(self.opts)
+            except Exception:  # pylint: disable=broad-except
+                log.error("Unable to remove the presence record", exc_info=True)
         self.transport.publish_daemon(
             self.publish_payload,
             self.presence_callback,
             self.remove_presence_callback,
             secrets=secrets,
             started=started,
+            on_start=self._start_presence_heartbeat,
         )
 
+    def _start_presence_heartbeat(self):
+        """Begin refreshing the record, on the publish daemon's own loop.
+
+        The heartbeat used to begin with the first subscriber, which left
+        a master that is quiet but populated -- a settled fleet, nobody
+        arriving or leaving -- refreshing nothing. Its record ages past
+        ``STALE_AFTER`` and every one of those connected minions drops
+        back to address matching, which is the NAT bug this exists to
+        fix, arriving two minutes after things went quiet.
+
+        It does nothing for a publish server with nobody connected: an
+        empty roster is refused by ``salt.utils.presence.read`` however
+        fresh it is.
+
+        Scheduled from ``publish_daemon`` because this object has no ioloop
+        of its own: ``_publish_daemon`` runs before the daemon's loop
+        exists and then blocks inside it.
+        """
+        if not self._presence_recording:
+            return
+        try:
+            self._schedule_presence_flush(rearm=True)
+        except Exception:  # pylint: disable=broad-except
+            log.error("Unable to start the presence heartbeat", exc_info=True)
+
     async def presence_callback(self, subscriber, msg):
+        if msg is None:
+            # The transport established the identity itself and has nothing
+            # for us to verify — 0MQ carries it in the subscription topic
+            # rather than in a payload. Unlike the TCP path below there is no
+            # token to check, so this presence is advisory; the transport is
+            # responsible for only reporting ids it already trusts.
+            #
+            # Which is why an id the transport did *not* set is refused here.
+            # ``msg`` is not always ours: the tcp transport hands us
+            # ``framed_msg["body"]`` straight off an unauthenticated stream,
+            # and a subscriber that sends a nil body reaches this branch with
+            # ``id_`` still None -- skipping ``verify_minion`` entirely and
+            # landing a nameless client in ``present`` that
+            # ``_remove_client_present`` then refuses to take back out again.
+            id_ = getattr(subscriber, "id_", None)
+            if not isinstance(id_, str) or not id_:
+                # debug, not warning: the trigger is remote and unauthenticated,
+                # so this must not be a way to fill the master's log.
+                log.debug(
+                    "Ignoring presence from a subscriber the transport did not"
+                    " name (id_=%r)",
+                    id_,
+                )
+                return
+            self._add_client_present(subscriber)
+            return
         if msg["enc"] != "aes":
             # We only accept 'aes' encoded messages for 'id'
             return
@@ -1564,22 +1708,206 @@ class PubServerChannel:
     def remove_presence_callback(self, subscriber):
         self._remove_client_present(subscriber)
 
+    @staticmethod
+    def _subscriber_address(client):
+        """Where a subscriber is connected from, as far as the transport knows.
+
+        The tcp transport's ``Subscriber`` carries tornado's ``(host, port)``;
+        the zeromq one carries 0MQ's ``Peer-Address`` string, which is empty
+        over IPC. Unknown is reported as an empty string rather than guessed.
+        """
+        address = getattr(client, "address", None)
+        if isinstance(address, (tuple, list)):
+            address = address[0] if address else None
+        return address if isinstance(address, str) else ""
+
+    def stop_recording_presence(self):
+        """Stop maintaining the record; readers should fall back.
+
+        Called by a transport whose subscription reader has stopped, which
+        it cannot restart. The connected set it left behind is frozen at
+        whatever was true when the reader died, and refreshing it would keep
+        advertising that snapshot as current for the life of the process --
+        ``STALE_AFTER`` cannot save a reader, because the part still running
+        is the part stamping the record.
+
+        So the record goes, rather than being left to age out. Leaving it
+        kept a frozen roster authoritative for a further ``STALE_AFTER``
+        -- naming minions that have since left and missing every arrival
+        -- which is the same thing ``salt.utils.presence.remove`` exists
+        to avoid when the option is turned off. Removing it hands the
+        question straight back to address matching, which is at least
+        able to change its mind.
+        """
+        if self._presence_recording:
+            # Only the channel that was recording may remove the record --
+            # the same guard ``close`` applies. A channel that never
+            # recorded shares the master id, so without this any future
+            # caller holding one would delete the live record and send
+            # every reader back to address matching, which is the NAT bug
+            # this feature exists to fix.
+            self._presence_recording = False
+            try:
+                salt.utils.presence.remove(self.opts)
+            except Exception:  # pylint: disable=broad-except
+                log.error("Unable to remove the presence record", exc_info=True)
+        #: A ``salt/presence/present`` event is owed; see
+        #: ``_fire_present_event``.
+        self._presence_event_pending = False
+        if self._presence_timer is not None:
+            self._presence_timer.cancel()
+            self._presence_timer = None
+
+    def _presence_snapshot(self):
+        # ``clients`` is a set, so a minion holding several connections from
+        # different addresses -- reconnecting through a different NAT, or a
+        # syndic -- would otherwise report whichever one iteration happened
+        # to yield first, and flap between them from one write to the next.
+        # Sorted so the answer is at least stable.
+        return {
+            id_: next(
+                iter(
+                    sorted(
+                        a for a in (self._subscriber_address(c) for c in clients) if a
+                    )
+                ),
+                "",
+            )
+            for id_, clients in self.present.items()
+        }
+
+    def _write_presence(self):
+        salt.utils.presence.write(
+            self.opts,
+            self._presence_snapshot(),
+            time.monotonic() - self._presence_started,
+        )
+        self._presence_dirty = False
+        # Monotonic, so a backward wall-clock step cannot put this in the
+        # future and make the difference below permanently negative. That
+        # wedges the heartbeat for the whole duration of the step, during
+        # which the reader also rejects the record as future-dated -- so
+        # the record is neither refreshed nor believed, and the bug this
+        # feature fixes is back for an unbounded time on an idle fleet.
+        self._presence_written = time.monotonic()
+
+    def _flush_presence(self):
+        """Persist the connected set if it changed, then re-arm.
+
+        Writing straight from _add_client_present would rewrite the whole
+        record once per minion during a mass reconnect -- quadratic in fleet
+        size, at the moment the master is busiest -- so changes are coalesced
+        into at most one write per second. The timer keeps running once
+        started so the record is refreshed even while nothing changes:
+        ``salt.utils.presence`` treats an un-refreshed record as "no answer",
+        and that has to mean a dead publish server rather than a quiet one.
+        """
+        self._presence_timer = None
+        self._fire_present_event()
+        if not self._presence_recording:
+            # Recording was retired (the subscription reader stopped). Do not
+            # re-arm: the connected set is frozen, and going on refreshing it
+            # would advertise that snapshot as current for the life of the
+            # process, which is exactly what stop_recording_presence exists
+            # to prevent.
+            return
+        try:
+            if (
+                self._presence_dirty
+                or time.monotonic() - self._presence_written
+                >= salt.utils.presence.HEARTBEAT
+            ):
+                self._write_presence()
+        except Exception:  # pylint: disable=broad-except
+            log.error("Unable to record minion presence", exc_info=True)
+        finally:
+            self._schedule_presence_flush(rearm=True)
+
+    def _fire_present_event(self):
+        """Publish the whole connected set, at most once per flush tick.
+
+        ``salt/presence/present`` carries every connected id, so firing it
+        per arrival is quadratic in fleet size -- and it is fired on the
+        publish daemon's ioloop, the one that also sends every job. A
+        5,000-minion reconnect would otherwise serialise something like
+        12 million ids through the event bus while jobs waited behind it.
+        Coalescing costs nothing a consumer can observe: the event is a
+        snapshot, so the only one that mattered was the last.
+
+        ``salt/presence/change`` is still fired per edge. It names one
+        minion, it is what an edge-triggered consumer is listening for,
+        and collapsing those would lose information.
+        """
+        if not self._presence_event_pending:
+            return
+        self._presence_event_pending = False
+        try:
+            self.event.fire_event(
+                {"present": list(self.present.keys())},
+                salt.utils.event.tagify("present", "presence"),
+            )
+        except Exception:  # pylint: disable=broad-except
+            log.error("Unable to fire the presence event", exc_info=True)
+
+    def _schedule_presence_flush(self, rearm=False):
+        """Arrange for the record to be written shortly.
+
+        ``rearm`` marks the two calls that come from the heartbeat itself
+        -- starting it, and re-arming after a tick -- rather than from a
+        change. It matters only on the no-ioloop path below, where a
+        heartbeat call would otherwise recurse straight back into the
+        write it just finished.
+        """
+        if self._presence_timer is not None:
+            return
+        if not self._presence_recording and not self._presence_event_pending:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No ioloop to schedule on (tests, or a caller off the publish
+            # daemon's loop). Write straight through rather than silently
+            # never recording anything -- but only if this channel is the
+            # one that records at all. Reaching here with recording off
+            # would write the very record the gate exists to suppress.
+            if not rearm and self._presence_recording:
+                self._write_presence()
+            return
+        self._presence_timer = loop.call_later(1, self._flush_presence)
+
+    def _presence_changed(self):
+        """Note that the connected set changed; the record follows shortly.
+
+        A publish server that is not the one answering for the fleet still
+        tracks ``self.present`` -- it is what the presence *events* are
+        derived from -- but it must not write the record.
+        """
+        if self._presence_recording:
+            self._presence_dirty = True
+        self._schedule_presence_flush()
+
     def _add_client_present(self, client):
         id_ = client.id_
         if id_ in self.present:
             clients = self.present[id_]
             clients.add(client)
+            self._presence_changed()
         else:
             self.present[id_] = {client}
             if self.presence_events:
+                # Flagged *before* ``_presence_changed``, which is what
+                # arms the flush that eventually fires the snapshot.
+                # After retirement ``_schedule_presence_flush`` arms
+                # nothing unless one of recording or pending is already
+                # set, so setting it afterwards meant the snapshot waited
+                # on some later change arming a timer -- and never fired
+                # at all if none came.
+                self._presence_event_pending = True
                 data = {"new": [id_], "lost": []}
                 self.event.fire_event(
                     data, salt.utils.event.tagify("change", "presence")
                 )
-                data = {"present": list(self.present.keys())}
-                self.event.fire_event(
-                    data, salt.utils.event.tagify("present", "presence")
-                )
+            self._presence_changed()
 
     def _remove_client_present(self, client):
         id_ = client.id_
@@ -1600,14 +1928,19 @@ class PubServerChannel:
         if len(clients) == 0:
             del self.present[id_]
             if self.presence_events:
+                # Before the change, for the same reason as the arrival
+                # path above.
+                self._presence_event_pending = True
                 data = {"new": [], "lost": [id_]}
                 self.event.fire_event(
                     data, salt.utils.event.tagify("change", "presence")
                 )
-                data = {"present": list(self.present.keys())}
-                self.event.fire_event(
-                    data, salt.utils.event.tagify("present", "presence")
-                )
+        # After the id is dropped, not before: the snapshot is taken from
+        # ``self.present``, and where there is no ioloop to defer the write
+        # to, ``_presence_changed`` writes it synchronously -- which would
+        # record the departing minion as still connected and leave it there
+        # until something else happened to move.
+        self._presence_changed()
 
     async def publish_payload(self, load, *args):
         load = salt.payload.loads(load)

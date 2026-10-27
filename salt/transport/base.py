@@ -439,6 +439,7 @@ class DaemonizedPublishServer(PublishServer):
         remove_presence_callback=None,
         secrets=None,
         started=None,
+        on_start=None,
     ):
         """
         If a daemon is needed to act as a broker implement it here.
@@ -453,6 +454,11 @@ class DaemonizedPublishServer(PublishServer):
                                               longer present
         :param dict secrets: The master's secrets
         :param multiprocessing.Event started: An event to signal when the daemon has started
+        :param func on_start: Called once, on the daemon's own ioloop, as
+                              soon as that loop exists. The caller runs
+                              before the loop is created and then blocks
+                              inside it, so this is its only opportunity to
+                              schedule anything there.
         """
         raise NotImplementedError
 
