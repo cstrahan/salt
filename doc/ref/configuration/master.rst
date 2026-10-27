@@ -954,6 +954,53 @@ hardware serving your minions. The default of ``0`` means unlimited connections.
 Please note that this can slow down the authentication process a bit in large
 setups.
 
+.. versionchanged:: 3008.4
+
+    The connected count this is checked against used to be derived by matching
+    each minion's cached grain addresses against the master's socket table,
+    which cannot see a minion connecting from a different address than its
+    grains report (NAT, floating IPs, a master managing minions in another
+    network). The limit therefore failed open: a master could carry more
+    connected minions than ``max_minions`` without rejecting anything. Where
+    the publish server can say which minion is behind each connection, its
+    record is added to the count, so minions that address matching could
+    not see are now counted too.
+
+    Syndics count too. A syndic's publish connection is a subscriber like
+    any other and announces itself the same way, so a syndic that address
+    matching did not previously attribute to any id now occupies a slot.
+    There is no way to exempt it.
+
+    **Which masters this affects.** A master running ``tcp`` alone: always.
+    A master running ``zeromq`` alone: only where
+    :conf_master:`zmq_presence_subscriptions` is set; a default ``zeromq``
+    master counts exactly as it did in 3008.3 and nothing here changes for
+    it. A master configured with several transports at once: never, since no
+    single publish server knows the whole fleet. A ``ws`` master: never --
+    nothing here changes for it either. Where it does apply, **a
+    master that has been quietly over its limit will begin rejecting
+    authentications.**
+
+    On the ``zeromq`` transport the count comes from subscriptions, and a
+    minion can only announce itself -- the master assigns each minion one
+    topic and tells it no other. An outsider cannot inflate the count.
+    See the bound stated under
+    :conf_master:`zmq_presence_subscriptions` for what remains: a
+    compromised minion, and an attacker positioned to observe and replay
+    a subscription.
+
+    The count is the union of the record and address matching, so it can
+    only ever be larger than what Salt counted before -- the limit can
+    fail closed, never open. Where the record contributes nothing it is
+    exactly the old count: when it is missing, unreadable or stale; for
+    the first 30 seconds of a publish server's life, while it is still
+    waiting for the fleet to resubscribe; and when it names nobody,
+    which is what a fleet entirely too old to announce itself produces.
+
+    Note that with :conf_master:`con_cache` enabled the limit is checked
+    against the connected-minion cache rather than a fresh count, so any
+    of this reaches enforcement only at that cache's update interval.
+
 .. code-block:: yaml
 
     max_minions: 100
@@ -986,9 +1033,355 @@ regular interval with a list of connected minions, as well as events with lists
 of newly connected or disconnected minions. This is a master-only operation
 that does not send executions to minions.
 
+.. versionchanged:: 3008.4
+
+    On a ``zeromq`` master with :conf_master:`zmq_presence_subscriptions`
+    set, the publish server emits
+    these events itself and the periodic poll is switched off. Arrivals and
+    departures are then reported as they happen rather than on the next
+    poll, which is the point of the change. A ``tcp``-only master has
+    emitted these from its publish server for some time, so the switch away
+    from polling is not new to it -- but the coalescing below is, and so is
+    answering ``connected_ids()`` from the record.
+
+    Two things change for a ``zeromq`` master that enables it:
+
+    - ``salt/presence/present`` becomes edge-triggered. It previously fired
+      once per ``loop_interval`` whether or not anything had changed, and
+      now fires only when the connected set does. Anything treating it as a
+      heartbeat will stop hearing from it while the fleet is stable. It
+      carries the whole connected set, so it is coalesced to at most one
+      per second: a reconnecting fleet produces one snapshot per second
+      rather than one per minion. ``salt/presence/change``, which names a
+      single minion, is still fired for every arrival and departure.
+    - ``<cachedir>/presence-data``, which the polling loop maintained, stops
+      being updated. ``Maintenance`` still *reads* it at startup to seed the
+      set it compares against, which matters if the option is ever turned
+      back off -- see "Turning it off again" under
+      :conf_master:`zmq_presence_subscriptions`.
+
 .. code-block:: yaml
 
     presence_events: False
+
+.. conf_master:: zmq_filtering
+
+``zmq_filtering``
+-----------------
+
+Default: False
+
+Use ZeroMQ's publisher-side filtering. By default a published job is sent to
+every minion and filtered minion-side; with this enabled the master publishes
+each job to ``sha1(minion id)`` and minions subscribe only to their own, so
+ZeroMQ drops jobs for other minions before they reach the subscriber.
+
+This setting exists on **both** the master and the minion and must agree. The
+master decides what topic to publish on; the minion decides what to subscribe
+to. A minion whose own ``zmq_filtering`` is off subscribes to the empty topic
+and receives everything.
+
+.. warning::
+
+    Do not set this on the minions before the master. A minion that has it
+    subscribes only to its own topics, while a master that lacks it
+    publishes one untopicked frame matching none of them -- so those
+    minions stop receiving jobs altogether, and ``test.ping``, the obvious
+    way to check, is exactly what stops working.
+
+    The other order is safe: a master that has it publishes
+    ``[topic, payload]``, and a minion that does not is subscribed to
+    everything and accepts the job on its own topic or on ``broadcast``.
+    Set it on the master first, or on both together -- never on the
+    minions first.
+
+This setting has no bearing on presence. The topic it makes a minion
+subscribe to is derived from the minion id alone, so it names a subscriber
+without proving anything, and :conf_master:`zmq_presence_subscriptions`
+deliberately does not accept it. Presence is enabled by that option and
+only by it.
+
+.. code-block:: yaml
+
+    zmq_filtering: False
+
+.. conf_master:: zmq_presence_subscriptions
+
+``zmq_presence_subscriptions``
+------------------------------
+
+.. versionadded:: 3008.4
+
+Default: False
+
+Derive :ref:`presence events <event-master_presence>` from publish-channel
+subscriptions rather than by polling for connected minions. Only meaningful
+on the ``zeromq`` transport, and only on a master running that transport
+alone -- a master configured with several gets a publish server per
+transport, each of which would report its own share of the fleet as though
+it were all of it.
+
+By default presence is determined by matching each minion's cached ``ipv4`` /
+``ipv6`` grains against the addresses connected to the publish port. A minion
+that connects from a different address than its grains report -- behind NAT,
+through a floating IP, or from another network -- never matches and is
+reported absent even though it is reachable. Subscribers instead announce
+their identity to the publish server when they connect, so for those
+minions no address matching is needed, and arrivals and departures are
+reported as they happen rather than on a polling interval. The
+``salt/presence/*`` events come from that mechanism alone;
+``connected_ids()`` still consults address matching as well, for the
+minions it cannot name.
+
+Two caveats:
+
+- This requires minions new enough to announce themselves, and there is no
+  alternative source: ``zmq_filtering`` does not help, because the topic it
+  makes a minion subscribe to is derived from the id alone and so proves
+  nothing.
+
+  A minion too old to announce itself is therefore invisible *to this
+  mechanism*, and the master cannot detect the shortfall: without
+  ``zmq_filtering`` every such minion shares the one empty delivery
+  subscription, which ZeroMQ collapses into a single event, so the
+  unnameable subscribers cannot even be counted. (With ``zmq_filtering``
+  they arrive as distinct events, but the topic still names nobody.)
+
+  Those minions are not lost, because ``connected_ids()`` unions this
+  record with address matching rather than answering from it alone. A
+  partly-upgraded fleet reports every minion either mechanism can see,
+  and each minion gains the NAT fix as it is upgraded. What the record
+  cannot do for an un-upgraded minion, address matching does exactly as
+  badly as it always did -- which is the status quo, not a regression.
+
+  The event stream is the exception: ``salt/presence/change`` and
+  ``salt/presence/present`` are driven by the publish server alone, so
+  they name only minions that announce themselves. A consumer of those
+  events sees a partly-upgraded fleet as a growing one.
+
+  Order of rollout does not matter for correctness. Each step is a no-op
+  on its own -- with the option unset the master writes no record and
+  ``connected_ids()`` answers exactly as it did before -- so there is no
+  window in which anything depends on the two ends having been changed
+  together. Upgrading minions before setting the option simply means the
+  event stream is complete from the moment it is enabled.
+
+  Turning the option on before the fleet is upgraded is safe. Minions
+  too old to announce themselves are still found the way they always
+  were: the answer is the union of the record and address matching, so a
+  partly-upgraded fleet reports every minion either mechanism can see,
+  and gains the NAT fix for each minion as it is upgraded. Answering from
+  the record alone would instead have reported the whole un-upgraded
+  fleet as absent.
+- A minion proves which minion it is, rather than merely asserting it. The
+  topic is assigned by the master, not computed by the minion: the master
+  derives it from a secret of its own that no minion ever sees, and hands
+  the result to that minion inside the RSA-encrypted part of its
+  authentication reply. Producing a minion's topic therefore means either
+  having been given it or holding the master's secret. A hash of the id
+  alone would not do: ids are usually hostnames, so anything able to reach
+  the publish port could then claim presence for any minion -- and, since
+  cancelling a subscription only requires naming the topic, withdraw it
+  for one that is really connected.
+
+  That is a stronger guarantee than the address matching it replaces, which
+  counted any minion whose cached grain address matched a connected peer --
+  and under NAT, where many minions share one external address, that was
+  every minion behind the same gateway.
+
+  It is not absolute, in two directions. An attacker already on the
+  network path can observe a subscription and replay it -- claiming
+  presence for that minion, or cancelling it, since cancelling only
+  requires naming the topic. ZeroMQ without CURVE concedes on-path
+  attackers in any case; what changed is that this went from "any peer
+  that can reach the port" to "any peer already on the path".
+
+  A minion is dropped from the answer when its key is revoked: the
+  master's map of topics is built from the accepted keys and nothing
+  else, so an id with no accepted key has no topic, and a minion already
+  connected under one is retracted at the next check. Toggling
+  subscriptions also costs the publish daemon memory: ZeroMQ queues the
+  notifications in a deque it does not bound, so a sender that outpaces
+  the master's reader grows its memory rather than being throttled -- in
+  the process that delivers every job. The queued messages themselves are
+  freed once read; what the deque retains afterwards is its own storage. Do not expose the publish port to
+  anything you would not let publish.
+
+.. warning::
+
+    Presence from this transport is still a reporting aid rather than an
+    access-control input, and :conf_master:`max_minions` is enforced
+    against the count it produces. A minion that has authenticated can
+    announce only itself, so the count cannot be inflated by an outsider
+    -- but a compromised minion, or anyone who can observe and replay its
+    subscription from the network path, is inside that bound. Weigh that
+    before relying on the limit to hold against an adversary rather than
+    against accident.
+
+    With :conf_master:`con_cache` enabled the limit is checked against the
+    connected-minion cache rather than against a fresh answer, so a
+    change in the connected set reaches it only at that cache's update
+    interval.
+
+Enabling this also makes :py:func:`manage.present
+<salt.runners.manage.present>` and everything else that asks which minions are
+connected consult the publish server's record *in addition to* address
+matching, so they stop reporting a reachable minion as absent. That happens
+independently of :conf_master:`presence_events`, which controls only the
+event stream.
+
+The two are unioned rather than one replacing the other, because each
+covers what the other cannot. The record names the minion behind a
+connection outright, which address matching cannot do under NAT; address
+matching sees every connection, including minions too old to announce
+themselves. For any minion the record names, the record's answer wins, so
+``show_ip`` reports the real connection address.
+
+This means the answer can only ever be a superset of what Salt reported
+before, which matters most for :conf_master:`max_minions`: the limit can
+fail closed but never open. It also means address matching's *false
+positives* remain -- a minion that has gone away but whose stale cached
+grain address still matches some other connection is reported present,
+exactly as before. This feature addresses minions wrongly reported
+**absent**; it does not make the cached-grain heuristic reliable in the
+other direction.
+
+Because address matching still runs, enabling this does not save the
+cached-grain scan; it adds a small file read to it.
+
+Every upgraded minion sends its announcement subscription whatever the
+master is configured to do, so a master that never enables any of this
+still carries one extra subscription topic per minion in ZeroMQ's
+subscription trie. The trie has no path compression, so each topic costs
+roughly a node per byte of its unshared suffix; at tens of thousands of
+minions that is tens to low hundreds of megabytes depending on allocator
+overhead. Treat that as an order of magnitude rather than a budget --
+the point is only that it is not zero. Message matching is unaffected,
+since a published payload never descends that branch.
+
+Where an address is reported -- ``manage.present show_ip=True`` and anything
+else reading ``connected_ids(show_ip=True)`` -- it now comes from the
+connection rather than from cached grains, which is the point of the change.
+ZeroMQ does not supply one over IPC, so the address may be an empty string
+where it was previously always a grain address.
+
+:conf_master:`detect_remote_minions` keeps working: minions found on
+``remote_minions_port`` are not publish-channel subscribers, so with that
+setting on, the full address-matching scan still runs and its results are
+merged into the publish server's answer. The answer is a union of the two
+mechanisms whether or not this setting is on; what the setting changes is
+only which addresses count as connected -- it adds ``remote_minions_port``
+to the publish port. Address matching needs cached grains to match
+against, so this half of the answer contributes nothing when
+:conf_master:`minion_data_cache` is disabled, exactly as it did before; the
+publish server's own half still works without it.
+
+.. code-block:: yaml
+
+    zmq_presence_subscriptions: False
+
+The master's presence secret
+****************************
+
+Enabling this creates ``presence_secret`` beside the accepted keys --
+in :conf_master:`cluster_pki_dir` on a cluster, otherwise in
+:conf_master:`pki_dir` -- owner-readable only. It is written once, on the
+first authentication after the option is enabled, and never rotated.
+
+Every minion's topic is derived from it, so:
+
+- **Back it up with the rest of the pki directory.** It is not
+  reconstructible from anything else.
+- **Cluster peers must share it**, which is why it lives in
+  ``cluster_pki_dir`` when one is configured. A minion may authenticate
+  to one peer and have its publish connection land on another; if the
+  two disagree, the second cannot name it.
+
+  With :conf_master:`cluster_isolated_filesystem` set, peers do not
+  share that directory and the cluster's own state sync does not
+  replicate this file -- so each peer mints its own and the mismatch
+  above is the normal case. The master logs a warning. Replicate
+  ``presence_secret`` across peers yourself, or accept that presence
+  falls back to address matching for any minion whose authentication
+  and publish connections land on different peers.
+- **Losing it is recoverable but not free.** A master that cannot find
+  it writes a new one, and every currently connected minion goes on
+  announcing a topic the master no longer computes. Those minions are
+  reported by address matching alone until each one reconnects and is
+  assigned its new topic -- so on a NAT'd fleet they read as absent for
+  that long. Restarting the minions, or simply waiting for them to
+  reconnect, restores it.
+
+A master that cannot read the file at all -- a permissions mistake, a
+full disk at first write -- logs an error and names no subscriber, which
+falls back to address matching rather than reporting an empty fleet.
+
+On a master cluster
+*******************
+
+Each master answers for the minions connected to *it*. That is the scope
+address matching always had -- a peer's socket table never contained
+another peer's connections -- and Salt does not merge presence across a
+cluster, before or after this change. ``manage.present`` run on one peer
+reports that peer's share of the fleet.
+
+Peers that share a ``cachedir`` do not interfere: the record is named after
+the master that wrote it, and each master reads only its own. (Salt's older
+``<cachedir>/presence-data`` is not named that way, so on a shared cachedir
+every peer's ``Maintenance`` writes the same file; that is pre-existing and
+unaffected here.)
+
+If you need a cluster-wide view, union the answers from each peer at the
+point of use. Doing it inside the master would mean deciding whether a
+peer that has written nothing is empty or merely absent, and from a shared
+directory that question has no safe answer.
+
+Turning it off again
+********************
+
+The publish server removes its record on startup when presence is not
+enabled, so turning the option off and restarting the master clears
+``subscription-presence-<master>-<digest>.p`` from its ``cachedir``.
+The option is only read when the publish daemon starts, so editing the
+config alone changes nothing: the running daemon goes on recording, and
+its record stays accurate while it does. The removal happens on the
+restart that actually applies the change.
+
+A record is also removed, without waiting for a restart, if the
+subscription reader stops or the publish server shuts down cleanly --
+in both cases the connected set it was tracking has frozen, and a frozen
+roster left on disk would stay authoritative for its remaining two
+minutes.
+
+A record left behind by a master that was renamed, or by a cluster peer
+that has been decommissioned, is never removed by anything, because no
+publish server starts up owning that name. Delete it by hand.
+
+The other leftover matters more briefly. ``Maintenance`` seeds the set it
+compares against from ``<cachedir>/presence-data``, which has a one-hour
+TTL and has not been updated while the publish server owned presence. When
+the poll resumes it therefore compares a stale set against the current one
+and fires a single ``salt/presence/change`` naming the difference --
+minions that have since left under ``lost``, and any that joined while the
+publish server owned presence under ``new`` -- followed by a
+``salt/presence/present``. ``Maintenance`` fires the ``change`` event
+only when that diff is non-empty, so a fleet that has not actually
+changed produces no ``change`` at all; one that has produces a one-off
+burst.
+
+Note which way the TTL cuts. ``CacheDisk`` *deletes* an expired key
+rather than returning a stale value, so a ``presence-data`` older than
+its hour leaves ``Maintenance`` with an empty set to compare against --
+and it then fires one ``salt/presence/change`` with the **entire fleet**
+under ``new``. Deleting the file by hand does the same thing. So waiting
+the hour out, or clearing the file, produces the largest possible burst
+rather than avoiding one; leaving a recent ``presence-data`` in place is
+what keeps the first event small. If a full-fleet ``new`` event would be
+disruptive to a consumer, restart the master with
+:conf_master:`presence_events` disabled and re-enable it once the
+consumer is ready.
+
+.. conf_master:: detect_remote_minions
 
 ``detect_remote_minions``
 -------------------------

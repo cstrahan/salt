@@ -174,9 +174,30 @@ Presence Events
 
 .. salt:event:: salt/presence/present
 
-    Events fired on a regular interval about currently connected, newly
-    connected, or recently disconnected minions. Requires the
-    :conf_master:`presence_events` setting to be enabled.
+    Events fired about currently connected, newly connected, or recently
+    disconnected minions. Requires the :conf_master:`presence_events`
+    setting to be enabled.
+
+    .. versionchanged:: 3008.4
+
+        Where the publish server knows which minion is behind each
+        connection, this fires when the connected set changes rather than
+        on a regular interval -- so a stable fleet produces no events, and
+        the event carrying the full set is coalesced to at most one per
+        second. That is the case on a master running ``tcp`` alone, or
+        ``zeromq`` alone with :conf_master:`zmq_presence_subscriptions`
+        set; a master configured with several transports at once keeps the
+        polled behaviour, since no one publish server then knows the whole
+        fleet.
+
+        On ``zeromq`` these events name only minions that announce
+        themselves, which means minions new enough to do so. That is
+        narrower than ``connected_ids()``, which also consults address
+        matching, so a partly-upgraded fleet appears here as a growing one
+        while ``manage.present`` already reports it in full. This does not
+        apply to ``tcp``, where the publish connection is authenticated
+        and every minion is named regardless of version. See
+        :conf_master:`presence_events`.
 
     :var present: A list of minions that are currently connected to the Salt
         master.
