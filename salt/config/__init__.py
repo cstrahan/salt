@@ -966,6 +966,13 @@ VALID_OPTS = immutabletypes.freeze(
         "password": (type(None), str),
         # Use zmq.SUSCRIBE to limit listening sockets to only process messages bound for them
         "zmq_filtering": bool,
+        # Let the publish server name the minion behind each connection from
+        # its subscriptions, rather than inferring it by matching cached
+        # grain addresses. Drives both the presence events and
+        # CkMinions.connected_ids() itself, independently of
+        # presence_events. Requires minions new enough to announce
+        # themselves on the presence topic.
+        "zmq_presence_subscriptions": bool,
         # Connection caching. Can greatly speed up salt performance.
         "con_cache": bool,
         "rotate_aes_key": bool,
@@ -1903,6 +1910,7 @@ DEFAULT_MASTER_OPTS = immutabletypes.freeze(
         "master_pubkey_signature": None,
         "master_use_pubkey_signature": False,
         "zmq_filtering": False,
+        "zmq_presence_subscriptions": False,
         "zmq_monitor": False,
         "con_cache": False,
         "rotate_aes_key": True,

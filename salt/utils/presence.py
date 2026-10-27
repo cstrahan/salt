@@ -452,3 +452,139 @@ def read(opts, stale_after=None):
         # answers already agree.
         return None
     return dict(minions)
+
+
+#: Name of the master's long-lived presence secret.
+PRESENCE_SECRET = "presence_secret"
+
+
+def presence_secret_path(opts):
+    """Where this master keeps the secret its presence topics derive from.
+
+    Beside the accepted keys, and in ``cluster_pki_dir`` when clustered,
+    because cluster peers share a ``cachedir`` and a minion may
+    authenticate to one peer while its publish connection lands on
+    another. They have to agree on the topic or the second peer cannot
+    name it.
+    """
+    pki = opts.get("cluster_pki_dir") or opts["pki_dir"]
+    if opts.get("cluster_isolated_filesystem"):
+        # The premise above does not hold in this mode: peers
+        # deliberately do not share ``cluster_pki_dir``, and the
+        # join-time state sync replicates only keys, denied_keys,
+        # file_roots and pillar_roots -- not this. Each peer therefore
+        # mints its own secret, and a minion that authenticates to one
+        # peer while its publish connection lands on another cannot be
+        # named by the second. Warned rather than refused, because
+        # presence still works for every minion whose two connections
+        # land on the same peer, and falls back to address matching for
+        # the rest.
+        _warn(
+            "isolated",
+            "cluster_isolated_filesystem is set, so cluster peers do not"
+            " share %s. A minion that authenticates to one peer and"
+            " publishes to another cannot be named by the second;"
+            " presence for it falls back to address matching. Replicate"
+            " %s across peers to avoid this.",
+            pki,
+            PRESENCE_SECRET,
+        )
+    return os.path.join(pki, PRESENCE_SECRET)
+
+
+def presence_secret(opts):
+    """Load the master's presence secret, generating it once if absent.
+
+    Long-lived on purpose. This is the whole point of the design: the
+    topic a minion announces on must not move while it is connected, and
+    anything derived from a rotating secret does. Nothing rotates this.
+
+    Losing it is survivable but disruptive -- every connected minion
+    keeps announcing a topic the master no longer computes, and is
+    unnameable until it re-authenticates -- so it is written 0600 and
+    left alone.
+    """
+    path = presence_secret_path(opts)
+    try:
+        with salt.utils.files.fopen(path, "rb") as fp_:
+            secret = fp_.read().strip()
+            if secret:
+                return secret
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _warn("secret", "Unable to read the presence secret: %s", exc)
+        return None
+
+    secret = binascii.hexlify(os.urandom(32))
+    try:
+        # An existing but empty file is replaced rather than respected.
+        # ``os.open`` can succeed and ``os.write`` then fail -- ENOSPC,
+        # EIO, or the process dying in between -- leaving a zero-byte
+        # file that no later call would ever replace: every read falls
+        # through to the exclusive create, which fails because the file
+        # exists, and the handler re-reads the same empty file. Presence
+        # would be dead for the life of the installation, silently.
+        if os.path.exists(path) and os.path.getsize(path) == 0:
+            log.warning(
+                "Presence secret %s is empty -- a previous write did not"
+                " finish. Replacing it; minions connected under the old"
+                " one are renamed as they reconnect.",
+                path,
+            )
+            os.unlink(path)
+    except OSError as exc:
+        _warn("secret", "Unable to replace the empty presence secret: %s", exc)
+        return None
+    try:
+        # Exclusive create, so two workers racing at first start cannot
+        # end up with different secrets: the loser re-reads the winner's.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, secret)
+        except BaseException:
+            # Do not leave the zero-byte file the check above exists to
+            # clean up after; a crash here is exactly how one appears.
+            os.close(fd)
+            fd = None
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        finally:
+            if fd is not None:
+                os.close(fd)
+        return secret
+    except FileExistsError:
+        try:
+            with salt.utils.files.fopen(path, "rb") as fp_:
+                return fp_.read().strip() or None
+        except OSError as exc:
+            _warn("secret", "Unable to re-read the presence secret: %s", exc)
+            return None
+    except OSError as exc:
+        _warn("secret", "Unable to write the presence secret: %s", exc)
+        return None
+
+
+def topic_for(opts, minion_id):
+    """The topic ``minion_id`` is told to announce itself on.
+
+    Assigned by the master rather than agreed by both ends. The minion
+    never derives it -- it is handed the result at authentication, inside
+    the RSA-encrypted part of the reply -- so it never appears in clear
+    on the wire and is tied to no other key material.
+
+    Derived rather than stored so there is no per-minion state to
+    persist: the master can recompute any minion's topic from the one
+    secret, which makes a lost or wiped cachedir a non-event here.
+    """
+    secret = presence_secret(opts)
+    if secret is None:
+        return None
+    return hmac.new(
+        secret,
+        salt.utils.stringutils.to_bytes(minion_id),
+        hashlib.sha256,
+    ).hexdigest()

@@ -4,9 +4,11 @@ Zeromq transport classes
 
 import asyncio
 import asyncio.exceptions
+import collections
 import datetime
 import errno
 import hashlib
+import hmac
 import logging
 import multiprocessing
 import os
@@ -16,6 +18,7 @@ import socket
 import stat
 import sys
 import threading
+import time
 import uuid
 import weakref
 import zlib
@@ -38,6 +41,7 @@ import salt.transport.base
 import salt.utils.asynchronous
 import salt.utils.files
 import salt.utils.process
+import salt.utils.presence
 import salt.utils.stringutils
 import salt.utils.zeromq
 from salt._compat import ipaddress
@@ -53,6 +57,38 @@ except ImportError:
 
 
 log = logging.getLogger(__name__)
+
+# Prefix of the subscription topic every publish subscriber announces its
+# identity on: ``PRESENCE_TOPIC_PREFIX`` + the digest the master assigned it.
+#
+# The master never publishes to this prefix -- published topics are sha1
+# hexdigests, ``broadcast`` and ``syndic`` -- so the subscription carries
+# identity without carrying any traffic. That is what lets the publish server
+# name the subscriber behind a connection (see
+# ``PublishServer._subscription_presence``) for *every* role rather than only
+# for the roles whose delivery topic happens to be identity-bearing.
+#
+# A syndic cannot simply subscribe to its own delivery topic instead: the
+# master publishes jobs to sha1(minion_id) for each targeted minion, a syndic is
+# normally an accepted minion of its master of masters, and a syndic that
+# received such a job would forward it to its entire sub-tree.
+PRESENCE_TOPIC_PREFIX = b"__salt_presence__:"
+
+
+#: Length of the hex digest ``salt.utils.presence.topic_for`` produces.
+_TOPIC_HEX_LEN = hashlib.sha256().digest_size * 2
+
+#: Longest subscription topic this reader will decode. Every topic it
+#: resolves is ``PRESENCE_TOPIC_PREFIX`` plus ``_TOPIC_HEX_LEN`` hex
+#: characters, so a couple of hundred bytes is already far more than any
+#: of them. The cap matters because the frames arrive from unauthenticated
+#: peers and decoding one costs several times its size.
+_MAX_TOPIC_LEN = 256
+
+#: Largest message the publish socket will accept from a subscriber when it
+#: is an XPUB. 0MQ drops the offending peer's connection rather than
+#: delivering anything over this.
+_MAX_SUBSCRIPTION_MSG = 8192
 
 # Payload marker for AsyncReqMessageClient queue: stop _send_recv gracefully.
 _REQ_QUEUE_SHUTDOWN = object()
@@ -189,6 +225,12 @@ class PublishClient(salt.transport.base.PublishClient):
 
         if _id:
             self._socket.setsockopt(zmq.IDENTITY, salt.utils.stringutils.to_bytes(_id))
+        # The announcement subscription is NOT set here. It is derived from
+        # the topic the master assigns at authentication, which has
+        # not happened yet when this socket is built -- see
+        # ``announce_presence``, which the channel calls once it has
+        # authenticated and again whenever it re-authenticates.
+        self._announced_topic = None
 
         # TODO: cleanup all the socket opts stuff
         if hasattr(zmq, "TCP_KEEPALIVE"):
@@ -312,6 +354,35 @@ class PublishClient(salt.transport.base.PublishClient):
         self.close()
 
     # TODO: this is the time to see if we are connected, maybe use the req channel to guess?
+    def announce_presence(self, topic):
+        """Announce on the topic the master assigned at authentication.
+
+        Nothing is ever published to it; the subscription exists purely
+        to carry identity, which is what makes presence survive NAT
+        (#66295).
+
+        The minion derives nothing. It is handed this string inside the
+        RSA-encrypted part of its auth reply, so the topic never appears
+        in clear in the auth reply -- and because the secret behind it
+        does not rotate, there is no re-announcement to make and no
+        ordering to get right between a new subscription and cancelling
+        an old one.
+
+        The SUBSCRIBE below does put the topic on the wire verbatim;
+        ZMTP carries it in the clear absent curve or a tunnel. What the
+        encrypted assignment buys is that an attacker who cannot see
+        this minion's traffic cannot derive its topic either.
+        """
+        if not topic:
+            return
+        if getattr(self, "_socket", None) is None:
+            return
+        wire = PRESENCE_TOPIC_PREFIX + salt.utils.stringutils.to_bytes(topic)
+        if wire == self._announced_topic:
+            return
+        self._socket.setsockopt(zmq.SUBSCRIBE, wire)
+        self._announced_topic = wire
+
     async def connect(
         self, port=None, connect_callback=None, disconnect_callback=None, timeout=None
     ):
@@ -1748,10 +1819,100 @@ class ZeroMQSocketMonitor:
         log.trace("Event monitor done!")
 
 
+def _strip_presence_prefix(topic):
+    """``topic`` without the announcement prefix, if it carries one.
+
+    The topic map is keyed by the bare digest, so everything that
+    looks a topic up has to agree about this.
+    """
+    prefix = PRESENCE_TOPIC_PREFIX.decode()
+    if topic.startswith(prefix):
+        return topic[len(prefix) :]
+    return topic
+
+
+def _peer_address(frame):
+    """The address a subscription frame arrived from, or ``""``.
+
+    0MQ attaches this to the frame as ``Peer-Address``. It is absent over IPC
+    and raises rather than returning None, hence the broad guard -- an address
+    is a nicety here, and failing to read one must not cost us the presence
+    event the frame represents.
+    """
+    getter = getattr(frame, "get", None)
+    if getter is None:
+        return ""
+    try:
+        return getter("Peer-Address") or ""
+    except Exception:  # pylint: disable=broad-except
+        return ""
+
+
+class _Unresolved(Exception):
+    """A subscription whose topic did not name anybody, so it was parked.
+
+    Control flow only -- it leaves the per-frame handler without skipping
+    the retry and revocation prune that follow it.
+    """
+
+
+class _SubscriberStub:
+    """Stand-in for a subscriber connection, for transports that have an id
+    but no connection object.
+
+    The presence bookkeeping in ``salt.channel.server`` keys on ``id_`` and
+    stores the object in a set, so it needs something hashable and stable per
+    subscription — 0MQ pub/sub exposes no connection handle.
+    """
+
+    __slots__ = ("id_", "address")
+
+    def __init__(self, id_, address=""):
+        self.id_ = id_
+        #: Where the subscriber connects from, for parity with the TCP
+        #: transport's ``Subscriber.address``. Empty when 0MQ does not report
+        #: one, as over IPC.
+        self.address = address
+
+
 class PublishServer(salt.transport.base.DaemonizedPublishServer):
     """
     Encapsulate synchronous operations for a publisher channel
     """
+
+    # Backstop rebuild interval, in seconds, for the subscription topic map
+    # (see _topic_to_minion).
+    _topic_map_interval = 60
+    #: Never rebuild the topic map more often than this. An
+    #: ``auto_accept`` storm writes accepted keys continuously, so the
+    #: directory mtime moves constantly and would otherwise rebuild per
+    #: message
+    #: -- a listdir, a stat per minion, and a read for each key that
+    #: rotated, on the loop that publishes jobs.
+    #: Safe only because a topic that fails to resolve is parked and retried
+    #: rather than dropped; see ``_unresolved``.
+    _topic_map_min_interval = 1.0
+    #: Most unresolved topics to hold for retry. They arrive from
+    #: unauthenticated peers, so this cannot be allowed to grow freely --
+    #: but it has to be able to hold a whole fleet, because a legitimate
+    #: topic parks when a minion subscribes before the master has rebuilt
+    #: its map -- an ``auto_accept`` storm can do that to many minions at
+    #: once. (A master *restart* does not: the first frame rebuilds from
+    #: session files that already exist, so the fleet resolves rather than
+    #: parking.) An entry is a prefixed topic -- a 64-character digest
+    #: behind an 18-byte prefix -- and an address, so this is single-digit
+    #: megabytes at the limit.
+    _max_unresolved = 16384
+    #: How long a parked topic stays parked. Bounded because a topic an
+    #: unauthenticated peer invented resolves on no rebuild ever, so
+    #: without a deadline the sweeper would run for the life of the
+    #: publish daemon.
+    #:
+    #: Generous relative to what it covers: a minion cannot compute its
+    #: topic before it has authenticated, so parking is not "waiting for
+    #: an operator to accept a key", it is a sub-second staleness race
+    #: that the first sweep resolves.
+    _unresolved_ttl = 60.0
 
     async_methods = [
         "publish",
@@ -1798,6 +1959,44 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         self.daemon_pull_sock = None
         self.daemon_monitor = None
         self.secrets = secrets
+        # Subscription-derived presence (see _subscription_presence):
+        # announcement topic -> minion_id, and topic -> subscriber stub.
+        self._topic_map = {}
+        self._topic_map_stamp = -1
+        self._topic_map_built = 0.0
+        #: Bumped on every rebuild, so the unresolved sweep can tell whether
+        #: there is any point running again.
+        self._topic_map_generation = 0
+        #: The timer task that retries parked subscriptions, or None.
+        self._sweeper = None
+        self._unresolved_generation = -1
+        #: Subscriptions whose topic did not resolve when it arrived, kept
+        #: so a later rebuild can still name them. libzmq delivers each
+        #: SUBSCRIBE exactly once, so without this a minion that subscribed
+        #: whose accepted key the master had not yet seen -- the rebuild is
+        #: debounced, a network filesystem can lag, a listing can fail --
+        #: would be
+        #: invisible for the life of its connection, with the record
+        #: staying settled so nothing fell back either.
+        #: topic -> (address, deadline), oldest first. Eviction takes
+        #: from the new end; see ``_park_unresolved``.
+        self._unresolved = collections.OrderedDict()
+        #: Whether the last topic-map rebuild saw the directories, and the
+        #: generation ``_prune_revoked`` last acted on.
+        self._topic_map_complete = False
+        self._pruned_generation = -1
+        self._readmitted_generation = -1
+        #: When the directories were last stat-ed, as opposed to when the
+        #: map was last rebuilt; see ``_topic_to_minion``.
+        self._topic_map_checked = 0.0
+        self._remove_presence_callback = None
+        self._presence_callback = None
+        self._revocation_watch = None
+        #: Subscribers retracted by ``_prune_revoked`` whose subscription
+        #: is still live, keyed by topic; see ``_readmit_restored``.
+        self._retracted = {}
+        self._present = {}
+        self._presence_task = None
         if started is None:
             self.started = multiprocessing.Event()
         else:
@@ -1860,9 +2059,13 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
             # none of its own, and anything it needs to schedule has to be
             # scheduled here or not at all.
             io_loop.call_soon(on_start)
-
         publisher_task = io_loop.create_task(
-            self.publisher(publish_payload, io_loop=io_loop),
+            self.publisher(
+                publish_payload,
+                presence_callback=presence_callback,
+                remove_presence_callback=remove_presence_callback,
+                io_loop=io_loop,
+            ),
             name="PublishServer.publisher",
         )
         publisher_task._log_destroy_pending = False
@@ -1873,8 +2076,49 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
             print("publish_daemon closing!")
             self.close()
 
-    def _get_sockets(self, context, io_loop):
-        pub_sock = context.socket(zmq.PUB)
+    def _get_sockets(self, context, io_loop, subscriptions=False):
+        if subscriptions:
+            # XPUB rather than PUB: an XPUB publisher receives the SUBSCRIBE /
+            # UNSUBSCRIBE messages its subscribers send, which is the only
+            # per-subscriber signal 0MQ pub/sub offers. Subscribers announce
+            # themselves on PRESENCE_TOPIC_PREFIX + an assigned digest, so those
+            # carry identity and give this transport the same id-keyed presence
+            # the TCP transport has. XPUB is otherwise a superset of PUB for
+            # publishing; subscribers see no difference.
+            pub_sock = context.socket(zmq.XPUB)
+            # Deliberately *not* XPUB_VERBOSE. libzmq refcounts subscriptions
+            # per topic and delivers the first subscribe and the last
+            # unsubscribe for each, which for an identity-bearing topic -- one
+            # subscriber per topic -- is exactly one presence edge in each
+            # direction, including when a minion reconnects over its own
+            # not-yet-reaped connection. XPUB_VERBOSE would add a message
+            # per duplicate subscribe with no extra information.
+            #
+            # It would not, however, be the difference between a bounded
+            # and an unbounded pending queue: that queue is a FIFO of
+            # notification events, not a set of live topics, and
+            # non-verbose does not bound it. Measured on libzmq 4.3.5,
+            # 400k subscribe/unsubscribe toggles of one topic with
+            # verbose OFF grew the publisher by ~160 MB -- every toggle
+            # is a first-add and a last-remove, so every one notifies.
+            # See the hazard note in ``_subscription_presence``.
+            #
+            # An XPUB, unlike a PUB, keeps whatever its subscribers send
+            # upstream instead of discarding it, and 0MQ places no limit on
+            # a message by default. Without this an unauthenticated peer
+            # that can reach the publish port could hand the publish daemon
+            # frames of any size and watch its memory follow. Subscription
+            # messages are tens of bytes; the cap is generous beside that
+            # and far below anything worth worrying about.
+            pub_sock.setsockopt(zmq.MAXMSGSIZE, _MAX_SUBSCRIPTION_MSG)
+        else:
+            # Only ask for subscription messages when something is going to
+            # read them: libzmq drains subscription frames off the inbound
+            # pipes as they arrive and holds them in a pending queue that
+            # grows until the application recv()s it. The ``RCVHWM`` set
+            # below bounds the pipes, not that queue, so an XPUB nobody
+            # drains accumulates for the life of the master.
+            pub_sock = context.socket(zmq.PUB)
         monitor = ZeroMQSocketMonitor(pub_sock)
         monitor.start_io_loop(io_loop)
         _set_tcp_keepalive(pub_sock, self.opts)
@@ -1930,13 +2174,34 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         print("publisher task started!")
         if io_loop is None:
             io_loop = tornado.ioloop.IOLoop.current()
+        # Imported here rather than at module scope: salt.utils.channel imports
+        # salt.master, which imports its way back into the transports. Import
+        # the name, not the package -- ``import salt.utils.channel`` would bind
+        # ``salt`` as a local for the whole function.
+        from salt.utils.channel import transport_provides_presence
+
+        # The same predicate salt.channel.server.PubServerChannel.factory and
+        # salt.master.Maintenance use to decide who owns presence, so the
+        # subscription reader runs exactly when the publish server is the one
+        # expected to report it.
+        presence = presence_callback is not None and transport_provides_presence(
+            self.opts
+        )
         self.daemon_context = zmq.asyncio.Context()
         (
             self.daemon_pull_sock,
             self.daemon_pub_sock,
             self.daemon_monitor,
-        ) = self._get_sockets(self.daemon_context, io_loop)
+        ) = self._get_sockets(self.daemon_context, io_loop, subscriptions=presence)
         print("publisher sockets created, setting started event!")
+        if presence:
+            self._presence_task = io_loop.create_task(
+                self._subscription_presence(
+                    presence_callback, remove_presence_callback
+                ),
+                name="PublishServer.subscription_presence",
+            )
+            self._presence_task._log_destroy_pending = False
         self.started.set()
         while True:
             try:
@@ -1946,6 +2211,927 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
                 log.error(
                     "Exception in publisher %s %s",
                     self.pull_uri,
+                    exc,
+                    exc_info_on_loglevel=logging.DEBUG,
+                )
+
+    def _accepted_keys_dir(self):
+        """Directory holding the accepted minion keys.
+
+        Cluster masters keep the shared key set in ``cluster_pki_dir``;
+        this is the same branch ``salt.key.Key`` and
+        ``salt.master.Maintenance`` make.
+        """
+        if self.opts.get("cluster_id", None):
+            pki_dir = self.opts.get("cluster_pki_dir") or self.opts["pki_dir"]
+        else:
+            pki_dir = self.opts["pki_dir"]
+        return os.path.join(pki_dir, "minions")
+
+    def _read_topic_map(self):
+        """Build announcement-topic -> minion_id over the accepted keys.
+
+        The topic is an HMAC of the minion id under a secret only this
+        master holds (see :func:`salt.utils.presence.topic_for`), so
+        producing one requires either having been handed it at
+        authentication or holding that secret. A plain hash of the id
+        would not: ids are usually hostnames, and anything able to reach
+        the publish port could then both claim presence for a minion and
+        withdraw it for one really connected.
+
+        Driven entirely by the accepted keys. There is no per-minion file
+        to read and no session directory involved -- the latter mattering
+        because ``ReqServerChannel`` creates ``<cachedir>/sessions/<id>``
+        from the id in a request, checked for shape and nothing else, so
+        anything able to reach the request port can create entries there.
+        Nothing an unauthenticated peer can write feeds this map or
+        triggers its rebuild any more.
+        """
+        accepted = self._accepted_keys_dir()
+        try:
+            ids = os.listdir(accepted)
+        except OSError as exc:
+            log.debug("Unable to list accepted keys in %s: %s", accepted, exc)
+            return {}, False
+        secret = salt.utils.presence.presence_secret(self.opts)
+        if secret is None:
+            log.error("No presence secret; no subscriber can be named")
+            return {}, False
+        topics = {}
+        for id_ in ids:
+            if id_.startswith("."):
+                continue
+            topics[
+                hmac.new(
+                    secret, salt.utils.stringutils.to_bytes(id_), hashlib.sha256
+                ).hexdigest()
+            ] = id_
+        return topics, True
+
+    def _topic_to_minion(self, topic):
+        """Resolve an announcement topic to a minion id.
+
+        The only topic that names a subscriber is
+        ``PRESENCE_TOPIC_PREFIX`` + the digest the master assigned. The bare
+        ``sha1(id)`` a minion subscribes to for delivery under
+        ``zmq_filtering`` is deliberately *not* accepted: it is derived
+        from the id alone, so honouring it would let anything able to
+        reach the publish port name itself any accepted minion, and
+        cancel the subscription of one that is really connected.
+
+        That makes ``zmq_filtering`` irrelevant to presence, which is the
+        tidier arrangement anyway -- presence is enabled by one option and
+        only by that option. The cost is that a minion too old to announce
+        itself cannot be seen at all; previously ``zmq_filtering`` covered
+        those, at the price of a forgeable topic.
+
+        Rebuilding the map costs one ``listdir`` and an HMAC per
+        accepted key -- no per-minion file is read at all -- and it is
+        driven by
+        unauthenticated remote input -- anything that can reach the
+        publish port can send subscriptions -- so it must not happen per
+        message. The accepted-keys directory's mtime is the trigger
+        instead.
+
+        Two intervals bound it from either side. A rebuild happens at most
+        once per ``_topic_map_min_interval``, because a busy master
+        accepts keys continuously and the trigger alone would fire
+        on nearly every message. It happens at least once per
+        ``_topic_map_interval``, as a backstop for filesystems whose
+        timestamp granularity could hide a change, which also bounds how
+        long a departed minion keeps resolving.
+
+        Debouncing is only safe because a topic that fails to resolve is
+        parked rather than dropped -- libzmq delivers each SUBSCRIBE
+        exactly once, so a miss during the debounce window would otherwise
+        lose that minion for the life of its connection. See
+        ``_park_unresolved``.
+        """
+        self._maybe_rebuild_topic_map()
+        return self._resolve(topic)
+
+    def _maybe_rebuild_topic_map(self, force=False):
+        """Rebuild the topic map if anything can have changed the answer.
+
+        ``force`` skips the debounce and the stamp comparison; it is for
+        the periodic revocation check, which has to run on a master that
+        is seeing no subscription traffic at all.
+        """
+        now = time.monotonic()
+        since_built = now - self._topic_map_built
+        # The clock first, the syscalls second. This runs per subscription
+        # frame, and the frames are unauthenticated: stat-ing before the
+        # debounce has been cleared spends a syscall per frame on an
+        # answer the debounce was going to throw away. The reader's drain
+        # rate is the only thing bounding the XPUB pending deque, which
+        # libzmq does not cap, so per-frame cost here is a memory-growth
+        # lever and not merely a CPU one.
+        if not force and now - self._topic_map_checked < self._topic_map_min_interval:
+            # Inside the debounce nothing can change the answer, so this
+            # frame pays for no syscalls at all.
+            #
+            # Gated on when the directories were last *checked*, not when
+            # the map was last rebuilt. Those differ whenever the stamp is
+            # unchanged -- the steady state -- and gating on the rebuild
+            # meant ``since_built`` stayed above the interval forever, so
+            # every frame thereafter paid both stats. That is work
+            # proportional to an unauthenticated peer's frame rate, which
+            # is the one thing this loop must not have.
+            return
+        self._topic_map_checked = now
+        try:
+            # One directory now: the accepted keys are the only input,
+            # and unlike the session directory nothing an unauthenticated
+            # peer can reach is able to touch it.
+            stamp = os.stat(self._accepted_keys_dir()).st_mtime_ns
+        except OSError:
+            stamp = None
+        if (
+            force
+            or stamp != self._topic_map_stamp
+            or since_built >= self._topic_map_interval
+        ):
+            topics, complete = self._read_topic_map()
+            self._topic_map = topics
+            self._topic_map_built = now
+            self._topic_map_generation += 1
+            # Whether this map is a real picture of the directories or the
+            # empty one a failed listdir produces. ``_prune_revoked`` must
+            # not act on the latter: it would read as "every key has been
+            # revoked" and retract the entire fleet.
+            self._topic_map_complete = complete
+            # Only remember the directory state if the read actually saw it.
+            # Caching the stamp after a failed listdir would pin an empty map
+            # in place until the directory changed again or the backstop
+            # fired, and every subscription arriving in that window would be
+            # dropped -- permanently, because libzmq delivers each SUBSCRIBE
+            # exactly once and the record goes on looking settled.
+            self._topic_map_stamp = stamp if complete else None
+
+    def _resolve(self, topic):
+        """Look a wire topic up in the map as it currently stands.
+
+        The prefix is *required*, not merely stripped:
+        ``_strip_presence_prefix`` is a no-op on a topic that does not
+        carry it, so stripping unconditionally would resolve a bare digest
+        too -- and disagree with ``_could_name_a_minion``, which does
+        require it. The two deciding differently is how a topic gets
+        parked forever, or named when it should not be.
+        """
+        if not topic.startswith(PRESENCE_TOPIC_PREFIX.decode()):
+            return None
+        return self._topic_map.get(_strip_presence_prefix(topic))
+
+    @staticmethod
+    def _could_name_a_minion(topic):
+        """Whether ``topic`` is even the right shape to resolve later.
+
+        Every topic this reader can name is the hex HMAC produced by
+        ``salt.utils.presence.topic_for``, behind ``PRESENCE_TOPIC_PREFIX``.
+        Anything else
+        will never resolve however long it is kept -- and keeping it is
+        exactly what an unauthenticated peer would want, since the parked
+        set is a fixed size and shared with the minions waiting to be named.
+        """
+        if not topic.startswith(PRESENCE_TOPIC_PREFIX.decode()):
+            return False
+        topic = _strip_presence_prefix(topic)
+        return len(topic) == _TOPIC_HEX_LEN and all(
+            c in "0123456789abcdef" for c in topic
+        )
+
+    def _park_unresolved(self, topic, address, deadline=None):
+        """Remember a subscription whose topic did not resolve.
+
+        Parking starts the sweeper, which is what eventually retries
+        this. It deliberately does *not* invalidate the topic map: the
+        topics that park are the ones an unauthenticated peer invented, so
+        rebuilding on a park would let it drive a ``listdir`` and a
+        fleet-sized dict per frame, on the loop that publishes every job.
+
+        ``deadline`` carries an existing entry's expiry across a re-park.
+        A re-park that restamped it would be refreshed on every sweep
+        tick, so an entry whose presence callback keeps failing would
+        never expire and the sweeper would never stop -- which is the one
+        thing ``_unresolved_ttl`` exists to guarantee.
+
+        Eviction takes the *newest* entry, which is the opposite of the
+        usual cache policy and is the whole defence here. The parked set
+        is fed by unauthenticated input. A legitimate park is always
+        older than whatever arrives after it: it happens when a minion
+        subscribes inside the rebuild debounce, and it clears on the next
+        sweep a second later. So under oldest-out a peer that can reach
+        the publish port evicts real minions by flooding -- and libzmq
+        never redelivers a SUBSCRIBE, so each one is invisible for the
+        life of its connection. Newest-out drops the flooder's current
+        frame instead and leaves the minion that has been waiting.
+
+        Junk cannot wedge the set the way it could before
+        ``_unresolved_ttl`` existed; it expires on its own.
+
+        Deliberately *not* bucketed per source address. That sounds like
+        the tighter rule and is the wrong one here: minions behind one
+        NAT share a source address -- the publish server sees the
+        gateway's, which is the entire situation this feature exists for
+        -- so a per-address cap truncates exactly the fleet it is meant
+        to protect, and does so silently.
+        """
+        if not self._could_name_a_minion(topic):
+            return
+        now = time.monotonic()
+        if deadline is None:
+            deadline = now + self._unresolved_ttl
+        self._unresolved.pop(topic, None)
+        self._unresolved[topic] = (address, deadline)
+        while len(self._unresolved) > self._max_unresolved:
+            # The newest *other* entry, never the one just inserted.
+            # ``popitem(last=True)`` takes the arrival itself, so a peer
+            # that fills the table first -- and it chooses when to send --
+            # gets every subsequent legitimate park discarded on arrival.
+            # libzmq never redelivers a SUBSCRIBE, so each of those
+            # minions is invisible for the life of its connection.
+            victim = next((t for t in reversed(self._unresolved) if t != topic), None)
+            if victim is None:
+                break
+            self._forget_unresolved(victim)
+
+    def _prune_revoked(self, remove_presence_callback):
+        """Retract subscribers whose key has been revoked.
+
+        The accepted-key check in ``_read_topic_map`` only runs on the
+        SUBSCRIBE edge, so without this a minion whose key is revoked
+        while it is connected stays in ``_present`` -- and so in
+        ``connected_ids()`` and in ``max_minions`` -- until its TCP
+        connection drops, which an operator revoking a key has no way to
+        force. Address matching, which this replaces, did not have that
+        hole: ``salt-key -d`` flushes the grains cache the matching reads.
+
+        Keyed on the *id*, not on whether the topic still resolves.
+        Those are not the same question, and only the first one means
+        revocation. The topic no longer moves while a minion is
+        connected -- it is assigned once from a secret that does not
+        rotate -- but the map can still come back empty for reasons that
+        are not revocations at all: a failed listing, an unreadable
+        secret. Retracting on "the topic stopped resolving" would drop
+        the whole fleet on any of those, reporting connected, reachable
+        minions as absent, which is the bug this feature exists to fix.
+
+        Only after a rebuild, and only a rebuild that actually saw the
+        directories: a failed ``listdir`` yields an empty map, and acting
+        on that would retract the whole fleet at once.
+        """
+        if not self._topic_map_complete:
+            return
+        if self._pruned_generation == self._topic_map_generation:
+            return
+        self._pruned_generation = self._topic_map_generation
+        accepted = self._accepted_keys_dir()
+        if not os.path.isdir(accepted):
+            # The directory itself is gone or unreadable. Every lookup
+            # below would say "revoked" and retract the whole fleet on
+            # what is really a filesystem problem.
+            log.warning(
+                "Accepted-keys directory %s is not readable; not retracting"
+                " any minion's presence",
+                accepted,
+            )
+            return
+        for topic in list(self._present):
+            stub = self._present.get(topic)
+            id_ = getattr(stub, "id_", None)
+            if id_ is None:
+                continue
+            try:
+                os.stat(os.path.join(accepted, id_))
+                continue
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                # Deliberately ``os.stat`` and not ``os.path.exists``:
+                # the latter swallows every OSError and returns False, so
+                # a directory that lists but whose children cannot be
+                # stat-ed -- an NFS EACCES or ESTALE blip, EMFILE, a
+                # permissions change -- would read as "every key revoked"
+                # and retract the entire fleet. There is no recovery path
+                # from that: the stubs are gone and libzmq will not
+                # redeliver the subscriptions. Only ENOENT is evidence of
+                # revocation.
+                log.warning(
+                    "Cannot tell whether %s still holds an accepted key"
+                    " (%s); leaving its presence alone",
+                    id_,
+                    exc,
+                )
+                continue
+            log.info(
+                "Minion %s no longer holds an accepted key; retracting its"
+                " presence (topic %s)",
+                id_,
+                topic,
+            )
+            if stub is not None and remove_presence_callback is not None:
+                try:
+                    remove_presence_callback(stub)
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.error(
+                        "Exception retracting presence for topic %s: %s",
+                        topic,
+                        exc,
+                        exc_info_on_loglevel=logging.DEBUG,
+                    )
+                    # Left in place so the next rebuild tries again,
+                    # rather than dropped here and leaked in the channel.
+                    continue
+            # Kept, not forgotten. libzmq delivers each SUBSCRIBE exactly
+            # once and ``announce_presence`` short-circuits on an
+            # unchanged topic, so a minion that stays connected across
+            # ``salt-key -d`` then ``salt-key -a`` sends nothing further
+            # -- and without this it is absent until it restarts, which
+            # may be never. Re-accepting a key has to be able to undo a
+            # retraction.
+            self._retracted[topic] = self._present.pop(topic)
+
+    def _readmit_restored(self):
+        """Re-admit subscribers whose key has been accepted again.
+
+        The counterpart to ``_prune_revoked``: the subscription is still
+        live on the socket -- nothing about a key being removed and
+        restored reaches the subscriber -- so the only thing that changed
+        is whether the master is willing to name it.
+
+        Bounded by ``_present``, which is fleet-bounded, not by anything
+        an unauthenticated peer supplies: a topic only ever enters here
+        by having been named and then retracted.
+
+        Gated on the topic-map generation, like ``_prune_revoked``.
+        Without that this ran per *frame*, costing a ``stat`` for every
+        retracted entry -- and ``_retracted`` is fleet-sized after a
+        ``salt-key -D``, with entries persisting until each minion
+        unsubscribes, which a revoked one has no reason to do. That made
+        it work proportional to the fleet for every frame an
+        unauthenticated peer chose to send, on the loop that publishes
+        every job. Nothing can change the answer between rebuilds
+        anyway: the accepted keys are the only input.
+        """
+        if not self._retracted or not self._topic_map_complete:
+            return
+        if self._readmitted_generation == self._topic_map_generation:
+            return
+        self._readmitted_generation = self._topic_map_generation
+        accepted = self._accepted_keys_dir()
+        if not os.path.isdir(accepted):
+            return
+        for topic, stub in list(self._retracted.items()):
+            try:
+                os.stat(os.path.join(accepted, stub.id_))
+            except OSError:
+                continue
+            log.info(
+                "Minion %s holds an accepted key again; restoring its"
+                " presence (topic %s)",
+                stub.id_,
+                topic,
+            )
+            del self._retracted[topic]
+            self._present[topic] = stub
+            yield stub
+
+    def _forget_unresolved(self, topic):
+        """Stop tracking a parked topic."""
+        self._unresolved.pop(topic, None)
+
+    def _expire_unresolved(self):
+        """Drop parked topics that have outlived ``_unresolved_ttl``.
+
+        This is what lets the sweeper stop. A topic invented by an
+        unauthenticated peer resolves on no rebuild ever, so without an
+        expiry the loop below would run for the life of the publish
+        daemon.
+        """
+        now = time.monotonic()
+        for topic, (_, deadline) in list(self._unresolved.items()):
+            if deadline <= now:
+                log.debug("Giving up on unresolved subscription topic %s", topic)
+                self._forget_unresolved(topic)
+
+    async def _watch_revocations(self, remove_presence_callback):
+        """Retract revoked minions on a timer, not only on traffic.
+
+        ``_prune_revoked`` is otherwise reached from two places that both
+        need something to be happening: the unresolved sweeper, which only
+        exists while something is parked, and the foot of the per-frame
+        subscription loop. A master in steady state has neither -- no
+        parked topics and no subscription frames, because libzmq sends one
+        SUBSCRIBE per topic and nothing repeats it.
+
+        That is precisely the state an operator is in when they run
+        ``salt-key -d``. Without this the revoked minion would stay in
+        ``connected_ids()`` and in ``max_minions`` until something
+        unrelated happened to arrive. ``salt-key -d`` does rotate the AES
+        key, but a re-authentication produces no new SUBSCRIBE unless the
+        *session* key moved too, so it cannot be relied on to wake this up.
+
+        One forced rebuild per ``_topic_map_interval``, which is the same
+        cost the backstop in ``_maybe_rebuild_topic_map`` already pays on
+        a busy master.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._topic_map_interval)
+                try:
+                    self._maybe_rebuild_topic_map(force=True)
+                    self._prune_revoked(remove_presence_callback)
+                    for stub in self._readmit_restored():
+                        await self._presence_callback(stub, None)
+                except Exception:  # pylint: disable=broad-except
+                    log.error("Revocation check failed", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+
+    def _ensure_sweeper(self, presence_callback):
+        """Start the retry sweeper if anything is waiting for it."""
+        if self._sweeper is not None or not self._unresolved:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._sweeper = loop.create_task(
+            self._sweep_unresolved(presence_callback),
+            name="PublishServer.sweep_unresolved",
+        )
+        self._sweeper._log_destroy_pending = False
+
+    async def _sweep_unresolved(self, presence_callback):
+        """Retry parked subscriptions on a timer until none are left.
+
+        Time-driven rather than frame-driven, because the subscription
+        that needs retrying is often the *last* one to arrive -- the tail
+        of an ``auto_accept`` storm, or a lone minion on a quiet fleet --
+        and nothing follows it. libzmq delivers each SUBSCRIBE exactly
+        once, so a parked topic that is never swept is a minion invisible
+        for the life of its connection.
+
+        One rebuild per interval at most, however many topics are parked
+        and however fast they arrive, which is what keeps this from being
+        the amplifier that parking-forces-a-rebuild was.
+        """
+        try:
+            while self._unresolved:
+                await asyncio.sleep(self._topic_map_min_interval)
+                self._expire_unresolved()
+                if not self._unresolved:
+                    break
+                # Deliberately NOT forcing a rebuild. Forcing cost one
+                # full ``listdir`` and an HMAC per accepted key per tick
+                # for the whole TTL -- around sixty O(fleet) rebuilds
+                # bought with a single well-shaped frame from an
+                # unauthenticated peer, on the loop that publishes every
+                # job. The ordinary trigger already covers what parking
+                # waits for: a topic parks because the session file was
+                # written after the last rebuild, and that write changes
+                # the directory mtime, so the next call rebuilds anyway.
+                # Timestamp granularity hiding it is what the
+                # ``_topic_map_interval`` backstop is for.
+                self._topic_to_minion(next(iter(self._unresolved)))
+                await self._retry_unresolved(presence_callback)
+                self._prune_revoked(self._remove_presence_callback)
+                if self._presence_callback is not None:
+                    for stub in self._readmit_restored():
+                        await self._presence_callback(stub, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            log.error("Unresolved-subscription sweeper failed", exc_info=True)
+        finally:
+            self._sweeper = None
+
+    async def _retry_unresolved(self, presence_callback):
+        """Name any parked subscription the topic map can now resolve.
+
+        Only worth doing when the map has actually been rebuilt: nothing
+        else can change the answer, and this runs after every
+        subscription-shaped frame. Resolving against ``_topic_map``
+        directly rather than through ``_topic_to_minion`` keeps it to one
+        dict lookup per entry -- the latter would ``stat`` the key
+        directory once per parked topic, which an unauthenticated peer
+        could turn into thousands of syscalls per message on the loop that
+        publishes every job.
+        """
+        if not self._unresolved:
+            return
+        if self._unresolved_generation == self._topic_map_generation:
+            return
+        self._unresolved_generation = self._topic_map_generation
+        for topic, (address, deadline) in list(self._unresolved.items()):
+            minion_id = self._resolve(topic)
+            if minion_id is None:
+                continue
+            self._forget_unresolved(topic)
+            if topic in self._present:
+                continue
+            stub = self._present.setdefault(topic, _SubscriberStub(minion_id, address))
+            log.debug("Subscription topic %s resolved on retry", topic)
+            try:
+                await presence_callback(stub, None)
+            except Exception as exc:  # pylint: disable=broad-except
+                # Same treatment as the main loop: undo the stub and put the
+                # topic back, or this retry has consumed the last chance the
+                # subscription had. Per topic, so one failure does not abandon
+                # the rest of the sweep -- and they would wait for the next
+                # rebuild, since the generation has already been advanced.
+                log.error(
+                    "Exception retrying presence for topic %s: %s",
+                    topic,
+                    exc,
+                    exc_info_on_loglevel=logging.DEBUG,
+                )
+                self._present.pop(topic, None)
+                # The original deadline, not a fresh one: see
+                # ``_park_unresolved``. A callback that keeps failing
+                # would otherwise hold the sweeper open forever.
+                self._park_unresolved(topic, address, deadline=deadline)
+                self._ensure_sweeper(presence_callback)
+
+    @staticmethod
+    def _retire_presence(presence_callback):
+        """Tell the channel behind the callback to stop recording presence.
+
+        The reader cannot be restarted, so once it stops the connected set
+        is frozen. The channel keeps a heartbeat running independently of
+        this coroutine, and it would go on republishing that frozen set as
+        current forever -- ``STALE_AFTER`` is no defence when the component
+        still running is the one stamping the record. Retiring it removes
+        the record, so readers fall back at once.
+        """
+        owner = getattr(presence_callback, "__self__", None)
+        stop = getattr(owner, "stop_recording_presence", None)
+        if stop is None:
+            return
+        try:
+            stop()
+        except Exception:  # pylint: disable=broad-except
+            log.error("Unable to retire the presence record", exc_info=True)
+
+    async def _subscription_presence(self, presence_callback, remove_presence_callback):
+        r"""Turn XPUB subscription traffic into presence events.
+
+        This is the 0MQ counterpart of the TCP transport's per-connection
+        presence callbacks. A SUBSCRIBE frame is ``b"\x01" + topic`` and an
+        UNSUBSCRIBE is ``b"\x00" + topic``; libzmq synthesises the
+        unsubscribe when a subscriber disconnects, which is what makes a
+        dropped minion observable.
+
+        Every role that announces itself is visible, syndics included. A
+        subscriber too old to send the announcement topic is *not* seen:
+        the bare ``sha1(id)`` a ``zmq_filtering`` minion subscribes to for
+        delivery is deliberately refused, because it is derived from the
+        id alone and so names a subscriber without proving anything. A
+        partly-upgraded fleet therefore under-reports, which the option's
+        documentation leads with.
+
+        The identity is proved rather than asserted. The topic is
+        assigned by the master, derived from a secret of its own that no
+        minion holds, and handed to that minion inside the encrypted part
+        of its auth reply -- so producing one means either having been
+        given it or holding the master's secret. The map is built from
+        the accepted keys alone, so revoking a key removes the topic, and
+        a minion already connected under it is retracted at the next
+        check.
+
+        What that does *not* cover, and the reason presence from this
+        transport is still a reporting aid rather than an access-control
+        input:
+
+        - *A compromised minion* can announce itself, which is simply what
+          it is entitled to do.
+        - *An on-path observer* can see a subscription frame and replay
+          it, claiming presence for that minion -- or cancel it, since
+          cancelling only requires naming the topic, and libzmq forwards a
+          cancel even for a topic with no subscribers (checked against the
+          4.3.5 source: ``xpub_t::xread_activated`` notifies unless
+          ``rm_result == values_remain``, and ``generic_mtrie_t::rm``
+          returns ``not_found`` for a topic it does not hold). The real
+          subscriber stays subscribed and keeps receiving jobs, so nothing
+          else looks wrong. ZeroMQ without CURVE concedes on-path
+          attackers regardless.
+
+        - *How cheap this is.* Both of the above need nothing more than a
+          stock ``zmq.XSUB`` socket. The master's XPUB leaves
+          ``ZMQ_ONLY_FIRST_SUBSCRIBE`` at its default of false, and
+          ``xpub_t::xread_activated`` then sets ``_process_subscribe`` for
+          *every* part of an upstream multipart message -- so each part
+          that looks like a subscription is applied to the trie and handed
+          up, not just the first. The sender sets the same option on its
+          own socket for the opposite reason: to stop *its* XSUB
+          swallowing the continuation parts as local subscribe commands
+          before they reach the wire.
+
+          There is no way to tell them apart. libzmq pushes real
+          notifications to the application with their flags cleared, and it
+          does the same to a continuation part that happens to be
+          subscription-shaped, so even the MORE bit does not separate them:
+          sending ``[b"payload", b"\x01junk", b"\x00" + victim_topic]``
+          delivers three frames of which the last two are indistinguishable
+          from genuine traffic. An earlier version of this reader tried to
+          drop continuation parts and was defeated by exactly that; see
+          ``test_a_real_peer_can_forge_a_subscription_frame``, which pins
+          the behaviour so nobody tries again without measuring first.
+
+          A forged cancel is permanent, not transient: libzmq delivers
+          each SUBSCRIBE exactly once, so there is no later frame from
+          the victim to put it back, and it stays missing for the life of
+          its connection. Knowing the topic takes reading it off the
+          wire, which ZMTP carries in the clear absent curve or a tunnel.
+
+        - *Cost.* Each toggle is cheap to send and not cheap to handle. It
+          costs a map lookup here, and with ``presence_events`` on it also
+          costs a ``salt/presence/change`` event, plus a share of the
+          whole-fleet ``salt/presence/present`` that
+          ``PubServerChannel._fire_present_event`` coalesces to at most one
+          a second -- on the same ioloop that publishes every job. The
+          XPUB queue those arrive on is a deque libzmq grows without bound
+          (``RCVHWM`` bounds the pipes feeding it, not the deque), so a
+          sender that outpaces this reader grows the publish daemon's memory
+          rather than being throttled; ``ZMQ_MAXMSGSIZE`` caps how big any
+          one of them can be. Toggling an *offline* accepted minion's topic
+          is the cheapest way to drive both, since libzmq notifies on the
+          first subscribe and last unsubscribe and an offline minion holds
+          neither.
+
+          Per-message handling is a map lookup, and the shape filter runs
+          before it so an invented topic never reaches the resolve at all.
+          Inside the debounce window the lookup costs no syscalls either;
+          the ``stat`` that drives the rebuild sits behind the
+          clock check for that reason, since this reader's drain rate is
+          what bounds the unbounded deque described above.
+
+          The map itself is rebuilt at
+          most once a second and at least once a minute, which is what keeps
+          a continuous ``auto_accept`` storm from turning each subscription
+          into a ``listdir`` and a dict the size of the fleet. A rebuild is
+          still O(fleet), and the unresolved sweep that follows one is
+          O(parked); the point is that neither is per message. Do not add
+          per-message work to this loop without reconsidering that -- the
+          input is unauthenticated, so anything proportional to anything
+          here is someone else's lever on the loop that publishes jobs.
+
+        Closing any of these would take authenticated subscriptions, which
+        0MQ pub/sub does not have. Treat presence from this transport as a
+        reporting aid, not as an access-control input, and do not expose the
+        publish port to anything you would not let publish.
+        """
+        drain = False
+        # The sweeper runs outside this call and also prunes, so it needs
+        # the removal callback too.
+        self._remove_presence_callback = remove_presence_callback
+        self._presence_callback = presence_callback
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            self._revocation_watch = loop.create_task(
+                self._watch_revocations(remove_presence_callback),
+                name="PublishServer.watch_revocations",
+            )
+            self._revocation_watch._log_destroy_pending = False
+        try:
+            drain = await self._subscription_presence_loop(
+                presence_callback, remove_presence_callback
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            # Nothing below the per-frame handler is expected to escape, but
+            # if it does the socket is still an XPUB that is still being
+            # published on, and leaving it unread is the unbounded-growth
+            # problem rather than merely a lost feature.
+            log.error(
+                "Subscription reader for %s failed unexpectedly",
+                self.pub_uri,
+                exc_info=True,
+            )
+            drain = True
+        finally:
+            # Covers both ways out below and anything unexpected escaping
+            # the loop. Cancellation lands here too, where it is harmless:
+            # the publish server is shutting down regardless.
+            if self._sweeper is not None:
+                self._sweeper.cancel()
+                self._sweeper = None
+            if self._revocation_watch is not None:
+                self._revocation_watch.cancel()
+                self._revocation_watch = None
+            self._retire_presence(presence_callback)
+        if drain:
+            await self._drain_subscriptions()
+
+    async def _drain_subscriptions(self):
+        """Read and discard, after presence has been given up on.
+
+        The socket is still an XPUB and is still being published on, so
+        libzmq goes on moving subscription traffic off the inbound pipes
+        into a queue it never bounds -- ``RCVHWM`` bounds the pipes, not
+        that queue. Leaving it unread is the exact thing ``_get_sockets``
+        refuses to open an XPUB without a reader to avoid, except that here
+        it would last for the life of the publish daemon. Presence is gone
+        either way; this only stops it costing memory.
+        """
+        log.warning(
+            "Presence is no longer being recorded on %s; draining its"
+            " subscription queue so it does not grow unbounded",
+            self.pub_uri,
+        )
+        errors = 0
+        while True:
+            try:
+                await self.daemon_pub_sock.recv(copy=False)
+            except asyncio.CancelledError:
+                raise
+            except zmq.error.ZMQError:
+                # The socket is gone; there is nothing left to drain.
+                return
+            except Exception:  # pylint: disable=broad-except
+                # Nothing is interpreting these any more, so there is
+                # nothing to report. But a recv that keeps failing is not
+                # draining anything either, and spinning on it would be
+                # worse than the queue this is here to bound.
+                errors += 1
+                if errors >= 10:
+                    log.error(
+                        "Unable to drain the subscription queue on %s;" " giving up",
+                        self.pub_uri,
+                    )
+                    return
+                continue
+            errors = 0
+
+    async def _subscription_presence_loop(
+        self, presence_callback, remove_presence_callback
+    ):
+        """The read loop proper; see ``_subscription_presence``."""
+        errors = 0
+        while True:
+            try:
+                # copy=False so the frame's 0MQ metadata survives: it is
+                # where the subscriber's address comes from, the one thing a
+                # subscription cannot carry itself.
+                frame = await self.daemon_pub_sock.recv(copy=False)
+            except asyncio.CancelledError:
+                raise
+            except zmq.error.ZMQError as exc:
+                # The socket or its context is gone -- shutdown, or close()
+                # racing the ioloop. Nothing further can be read, and looping
+                # would spin this coroutine at full speed.
+                # Not debug: outside shutdown this permanently ends presence
+                # events and the record for this publish daemon, and that
+                # should not be invisible at the default level. The socket
+                # is gone with it, so there is nothing left to drain.
+                log.error("Subscription reader for %s stopping: %s", self.pub_uri, exc)
+                return False
+            except Exception as exc:  # pylint: disable=broad-except
+                errors += 1
+                log.error(
+                    "Exception reading subscriptions %s %s",
+                    self.pub_uri,
+                    exc,
+                    exc_info_on_loglevel=logging.DEBUG,
+                )
+                if errors >= 10:
+                    # Whatever this is, it is not transient. Give up rather
+                    # than burn a core logging the same failure forever.
+                    log.error(
+                        "Too many errors reading subscriptions on %s, presence "
+                        "events from this publish server will stop",
+                        self.pub_uri,
+                    )
+                    # The socket itself is probably fine -- it is the
+                    # handling that keeps failing -- so it still has to be
+                    # drained.
+                    return True
+                continue
+            errors = 0
+            data = bytes(frame)
+            if not data:
+                continue
+            verb = data[0]
+            if verb not in (0, 1):
+                # Not a subscription message at all. libzmq hands anything
+                # else a subscriber sends straight through to the
+                # application; it names nobody and is not a presence edge.
+                continue
+            if len(data) > _MAX_TOPIC_LEN:
+                # Decoding is the expensive part and this is unauthenticated
+                # input, so the length is checked before paying for it. No
+                # topic this reader resolves is anywhere near this long.
+                log.debug("Ignoring an implausibly long subscription topic")
+                continue
+            topic = data[1:].decode(errors="replace")
+            # The empty topic is what every subscriber sends without
+            # zmq_filtering, and broadcast / syndic are shared delivery
+            # topics; none of them names anybody. Skipped explicitly so they
+            # do not look like unrecognized subscribers in the log.
+            if not topic or topic in ("broadcast", "syndic"):
+                continue
+            try:
+                if verb:
+                    # Shape first: an invented topic is rejected on a
+                    # string test, without reaching the resolve or the
+                    # stats behind it. This is unauthenticated input.
+                    if not self._could_name_a_minion(topic):
+                        log.debug("Ignoring an unresolvable topic %s", topic)
+                        raise _Unresolved
+                    minion_id = self._topic_to_minion(topic)
+                    if minion_id is None:
+                        # Parked rather than dropped: the key may simply not
+                        # be visible yet, and libzmq will not repeat this
+                        # SUBSCRIBE. Retried on the next rebuild below.
+                        log.debug("Subscription from unrecognized topic %s", topic)
+                        self._park_unresolved(topic, _peer_address(frame))
+                        self._ensure_sweeper(presence_callback)
+                        # Deliberately NOT ``continue``: the retry and the
+                        # revocation prune at the foot of this loop still
+                        # have to run. The rebuild that just failed to name
+                        # this topic is also the one that can reveal a
+                        # revoked key, and skipping it here is how a
+                        # parking frame silently suppressed both.
+                        raise _Unresolved
+                    self._forget_unresolved(topic)
+                    # setdefault, so one topic keeps one stub: the channel
+                    # holds a *set* of subscribers per id, and a second stub
+                    # object would survive the single unsubscribe libzmq
+                    # sends when the last subscriber goes.
+                    #
+                    # The cost is that the address is whatever the first
+                    # subscribe carried. A minion reconnecting over its own
+                    # not-yet-reaped connection produces no new SUBSCRIBE --
+                    # that is libzmq's refcounting, and it is what keeps the
+                    # presence edges clean -- so ``show_ip`` can report the
+                    # address it had before the reconnect. Under NAT that is
+                    # the field most likely to have changed. Reporting the
+                    # older of two live addresses is still a real address
+                    # for a real connection, which the grain matching this
+                    # replaces could not manage at all.
+                    stub = self._present.setdefault(
+                        topic, _SubscriberStub(minion_id, _peer_address(frame))
+                    )
+                    await presence_callback(stub, None)
+                else:
+                    # Deliberately not resolved through _topic_to_minion: this
+                    # is keyed by topic and the stub already carries the id, so
+                    # a departure is honoured even once the topic has stopped
+                    # resolving. It does stop -- deleting or rejecting a key
+                    # while its minion is connected takes it out of the map --
+                    # and dropping the unsubscribe there would leave the minion
+                    # reported present for the life of the publish daemon.
+                    self._forget_unresolved(topic)
+                    # It may have been retracted while still subscribed;
+                    # this is the departure that finally clears it.
+                    self._retracted.pop(topic, None)
+                    stub = self._present.get(topic)
+                    if stub is not None and remove_presence_callback is not None:
+                        # Popped only once the callback has accepted it.
+                        # Popping first and letting the callback raise
+                        # would leave the channel holding a minion that
+                        # has gone, with no redelivery possible -- libzmq
+                        # sends one unsubscribe. The subscribe path above
+                        # takes the same care in the other direction.
+                        remove_presence_callback(stub)
+                    self._present.pop(topic, None)
+            except _Unresolved:
+                pass
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(
+                    "Exception handling presence for topic %s: %s",
+                    topic,
+                    exc,
+                    exc_info_on_loglevel=logging.DEBUG,
+                )
+                # A callback that raised leaves this subscription unrecorded
+                # in the channel, and libzmq will not deliver it again. The
+                # stub is already in ``_present`` by then -- it is created
+                # before the callback is awaited -- and the retry skips any
+                # topic that is, so it has to come back out or the minion is
+                # lost exactly as if it had never been parked.
+                if verb:
+                    # Unconditional, because one topic only ever has one
+                    # stub: XPUB is not in verbose mode, so libzmq
+                    # refcounts subscriptions per topic and delivers only
+                    # the first subscribe and the last unsubscribe -- see
+                    # ``_get_sockets``. A second peer subscribing to the
+                    # same topic produces no frame here at all.
+                    self._present.pop(topic, None)
+                    self._park_unresolved(topic, _peer_address(frame))
+                    self._ensure_sweeper(presence_callback)
+            try:
+                await self._retry_unresolved(presence_callback)
+                self._prune_revoked(remove_presence_callback)
+                for stub in self._readmit_restored():
+                    await presence_callback(stub, None)
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(
+                    "Exception retrying unresolved subscriptions: %s",
                     exc,
                     exc_info_on_loglevel=logging.DEBUG,
                 )
@@ -2026,6 +3212,17 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
             ctx = self.ctx
             self.ctx = None
             ctx.term()
+        if self._presence_task is not None:
+            # Marks the reader cancelled before its socket is destroyed, so
+            # the task is not left pending behind a dead socket. It does not
+            # generally unwind here: ``close`` runs from ``publish_daemon``'s
+            # ``finally``, after ``run_forever`` has already returned, so
+            # there is no loop left to resume the coroutine and deliver the
+            # CancelledError. Nothing downstream depends on it unwinding --
+            # the process is going away -- but do not add cleanup to the
+            # reader on the assumption that it runs.
+            self._presence_task.cancel()
+            self._presence_task = None
         if self.daemon_monitor:
             self.daemon_monitor.stop()
         if self.daemon_pub_sock:

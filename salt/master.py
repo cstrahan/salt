@@ -4564,6 +4564,22 @@ class AuthFuncs(TransportMethods):
             ret["session"] = await loop.run_in_executor(
                 None, pub.encrypt, session_material, enc_algo
             )
+            # The topic this minion announces itself on; see
+            # ``salt.utils.presence.topic_for``. Assigned by the master
+            # and carried inside the RSA-encrypted part of the reply, so
+            # the assignment itself is never readable in transit -- and
+            # because the
+            # secret behind it does not rotate -- stays valid for the
+            # life of the minion's publish connection.
+            _presence = (
+                salt.utils.presence.topic_for(self.opts, load["id"])
+                if transport_provides_presence(self.opts)
+                else None
+            )
+            if _presence is not None:
+                ret["presence"] = await loop.run_in_executor(
+                    None, pub.encrypt, _presence, enc_algo
+                )
         else:
             if "token" in load:
                 try:
@@ -4593,6 +4609,22 @@ class AuthFuncs(TransportMethods):
             ret["session"] = await loop.run_in_executor(
                 None, pub.encrypt, session_material, enc_algo
             )
+            # The topic this minion announces itself on; see
+            # ``salt.utils.presence.topic_for``. Assigned by the master
+            # and carried inside the RSA-encrypted part of the reply, so
+            # the assignment itself is never readable in transit -- and
+            # because the
+            # secret behind it does not rotate -- stays valid for the
+            # life of the minion's publish connection.
+            _presence = (
+                salt.utils.presence.topic_for(self.opts, load["id"])
+                if transport_provides_presence(self.opts)
+                else None
+            )
+            if _presence is not None:
+                ret["presence"] = await loop.run_in_executor(
+                    None, pub.encrypt, _presence, enc_algo
+                )
 
         if version < 3:
             log.warning(
@@ -5059,6 +5091,20 @@ class AuthFuncs(TransportMethods):
 
             ret["aes"] = pub.encrypt(aes, enc_algo)
             ret["session"] = pub.encrypt(self.session_key(load["id"]), enc_algo)
+            # The topic this minion announces itself on; see
+            # ``salt.utils.presence.topic_for``. Assigned by the master
+            # and carried inside the RSA-encrypted part of the reply, so
+            # the assignment itself is never readable in transit -- and
+            # because the
+            # secret behind it does not rotate -- stays valid for the
+            # life of the minion's publish connection.
+            _presence = (
+                salt.utils.presence.topic_for(self.opts, load["id"])
+                if transport_provides_presence(self.opts)
+                else None
+            )
+            if _presence is not None:
+                ret["presence"] = pub.encrypt(_presence, enc_algo)
         else:
             if "token" in load:
                 try:
@@ -5077,6 +5123,20 @@ class AuthFuncs(TransportMethods):
             aes = self.aes_key
             ret["aes"] = pub.encrypt(aes, enc_algo)
             ret["session"] = pub.encrypt(self.session_key(load["id"]), enc_algo)
+            # The topic this minion announces itself on; see
+            # ``salt.utils.presence.topic_for``. Assigned by the master
+            # and carried inside the RSA-encrypted part of the reply, so
+            # the assignment itself is never readable in transit -- and
+            # because the
+            # secret behind it does not rotate -- stays valid for the
+            # life of the minion's publish connection.
+            _presence = (
+                salt.utils.presence.topic_for(self.opts, load["id"])
+                if transport_provides_presence(self.opts)
+                else None
+            )
+            if _presence is not None:
+                ret["presence"] = pub.encrypt(_presence, enc_algo)
 
         if version < 3:
             log.warning(

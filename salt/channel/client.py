@@ -525,6 +525,24 @@ class AsyncPubChannel:
     def crypt(self):
         return "aes" if self.auth else "clear"
 
+    def _announce_presence(self):
+        """Tell the transport which topic to announce this minion on.
+
+        Only the zeromq transport has anything to announce -- the tcp one
+        authenticates its publish connection outright -- so this is a
+        no-op there. The topic is whatever the master assigned at
+        authentication; a master too old to assign one leaves it absent,
+        and this minion is simply not announced, which the master's own
+        fallback to address matching covers.
+        """
+        topic = (self.auth.creds or {}).get("presence")
+        if not topic:
+            return
+        announce = getattr(self.transport, "announce_presence", None)
+        if announce is None:
+            return
+        announce(topic)
+
     async def connect(self):
         """
         Return a future which completes when connected to the remote publisher
@@ -538,6 +556,17 @@ class AsyncPubChannel:
             # else take the relayed publish_port master reports
             else:
                 publish_port = self.auth.creds["publish_port"]
+            # Announce before connecting: the subscription is applied to
+            # the socket, and 0MQ sends it as soon as the connection comes
+            # up, so there is no window where the master sees a subscriber
+            # it cannot name.
+            #
+            # Once, and never again. The topic is assigned by the master
+            # and derived from a secret that does not rotate, so unlike a
+            # session-derived topic it stays valid for the life of this
+            # connection: nothing to keep in sync, and no re-announcement
+            # to order against a cancellation.
+            self._announce_presence()
             # TODO: The zeromq transport does not use connect_callback and
             # disconnect_callback.
             await self.transport.connect(

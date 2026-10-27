@@ -647,6 +647,45 @@ def test_an_implausible_pid_is_not_alive(pid):
     assert salt.utils.presence._writer_is_alive(pid) is False
 
 
+def test_an_empty_secret_file_is_replaced(tmp_path):
+    """
+    ``os.open`` can succeed and ``os.write`` then fail -- ENOSPC, EIO, or
+    the process dying in between -- leaving a zero-byte file. Without
+    this, every later call falls through to the exclusive create, which
+    fails because the file exists, and the handler re-reads the same
+    empty file: ``topic_for`` returns None forever, no minion is ever
+    assigned a topic, and the master silently reverts to address
+    matching. Only deleting the file by hand would recover.
+    """
+    opts = {"pki_dir": str(tmp_path)}
+    path = salt.utils.presence.presence_secret_path(opts)
+    pathlib.Path(path).write_bytes(b"")
+
+    secret = salt.utils.presence.presence_secret(opts)
+
+    assert secret, "an empty secret file was treated as authoritative"
+    assert salt.utils.presence.presence_secret(opts) == secret
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_a_failed_write_leaves_no_empty_secret_behind(tmp_path):
+    """
+    The other half: the zero-byte file must not be created in the first
+    place. A disk that fills during the write is the realistic producer.
+    """
+    opts = {"pki_dir": str(tmp_path)}
+    path = salt.utils.presence.presence_secret_path(opts)
+
+    with patch("os.write", side_effect=OSError(28, "No space left on device")):
+        salt.utils.presence.presence_secret(opts)
+
+    assert not os.path.exists(
+        path
+    ), "a zero-byte secret was left behind; presence would never recover"
+
+    assert salt.utils.presence.presence_secret(opts), "and it must recover now"
+
+
 def test_the_record_carries_the_writing_process_pid(opts):
     """
     The dead-writer rule is what stops a SIGKILLed or OOM-killed publish

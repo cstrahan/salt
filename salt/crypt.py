@@ -1462,6 +1462,14 @@ class AsyncAuth:
             auth["session"] = key.decrypt(
                 payload["session"], self.opts["encryption_algorithm"]
             )
+            if "presence" in payload:
+                # The topic the master has assigned this minion for
+                # presence announcements. Absent from an older master,
+                # in which case this minion simply does not announce and
+                # the master falls back to address matching for it.
+                auth["presence"] = salt.utils.stringutils.to_str(
+                    key.decrypt(payload["presence"], self.opts["encryption_algorithm"])
+                )
 
         master_pubkey_path = os.path.join(self.opts["pki_dir"], self.mpub)
         if os.path.exists(master_pubkey_path) and not PublicKey.from_file(
