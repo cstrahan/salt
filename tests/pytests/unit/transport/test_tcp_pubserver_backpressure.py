@@ -363,10 +363,14 @@ async def test_discard_slow_client_cancels_pending_drain_tasks(master_opts, io_l
         )
 
         server._discard_slow_client(client, reason="test-forced")
-        # Give asyncio one turn to deliver ``.cancel()`` to the drain
-        # coroutines that the fix should have called it on.
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        # Wait for the drain coroutines to actually finish rather than
+        # counting event-loop turns: ``_drain_loop`` suspends inside a
+        # nested ``wait_for``, so the number of turns a ``cancel()``
+        # needs to propagate out depends on the asyncio version and on
+        # which await the task happened to be parked at. The timeout
+        # keeps the failure mode intact -- if nothing cancelled them,
+        # they are still pending when it expires.
+        await asyncio.wait(drain_tasks_before_discard, timeout=10)
 
         still_alive = [t for t in drain_tasks_before_discard if not t.done()]
         assert not still_alive, (

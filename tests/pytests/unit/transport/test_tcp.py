@@ -100,15 +100,14 @@ def client_socket():
 
 
 def test_get_socket():
-    socket = salt.transport.tcp._get_socket({"ipv6": True})
+    # Compared against the stdlib constants rather than their numeric
+    # values, which are not portable: AF_INET6 is 10 on Linux, 23 on
+    # Windows and 30 on macOS.
+    sock = salt.transport.tcp._get_socket({"ipv6": True})
+    assert sock.family == socket.AF_INET6
 
-    if salt.utils.platform.is_windows():
-        assert int(socket.family) == 23
-    else:
-        assert int(socket.family) == 10
-
-    socket = salt.transport.tcp._get_socket({"ipv6": False})
-    assert int(socket.family) == 2
+    sock = salt.transport.tcp._get_socket({"ipv6": False})
+    assert sock.family == socket.AF_INET
 
 
 def test_get_bind_addr():
@@ -1320,11 +1319,11 @@ async def test_pub_server_paths_no_perms(master_opts, io_loop):
 
 
 @pytest.mark.skip_on_windows()
-async def test_pub_server_publisher_pull_path_perms(master_opts, io_loop, tmp_path):
+async def test_pub_server_publisher_pull_path_perms(master_opts, io_loop, ipc_dir):
     def publish_payload(payload):
         return payload
 
-    pull_path = str(tmp_path / "pull.ipc")
+    pull_path = str(ipc_dir / "pull.ipc")
     pull_path_perms = 0o664
     pubserv = salt.transport.tcp.PublishServer(
         master_opts,
@@ -1346,11 +1345,11 @@ async def test_pub_server_publisher_pull_path_perms(master_opts, io_loop, tmp_pa
 
 
 @pytest.mark.skip_on_windows()
-async def test_pub_server_publisher_pub_path_perms(master_opts, io_loop, tmp_path):
+async def test_pub_server_publisher_pub_path_perms(master_opts, io_loop, ipc_dir):
     def publish_payload(payload):
         return payload
 
-    pub_path = str(tmp_path / "pub.ipc")
+    pub_path = str(ipc_dir / "pub.ipc")
     pub_path_perms = 0o664
     pubserv = salt.transport.tcp.PublishServer(
         master_opts,
